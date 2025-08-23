@@ -11,6 +11,7 @@ from typing import Set, Any
 from pathlib import Path
 from random import random as rand
 from functools import lru_cache
+from uuid import uuid4
 from mathutils import Vector, Matrix
 from bpy.types import Context, Event
 from .utils import SELECTED_COLLECTIONS, get_default_tree
@@ -90,6 +91,422 @@ name2type = {
 
 def ui_scale():
     return bpy.context.preferences.system.ui_scale
+MLT_WEIGHT_MIN = -2.0
+MLT_WEIGHT_MAX = 2.0
+MLT_WEIGHT_STEP = 0.01
+MLT_WEIGHT_PRECISION = 2
+
+def get_proxy_prop_name(slot_index: int) -> str:
+    return f"mlt_weight_text_{slot_index}"
+def ensure_mlt_proxy(node, stat_name: str, index: int, default_value: float = 1.0):
+    """Ensure an animatable proxy float exists on the node class for a given text index."""
+    try:
+        # Register/ensure class property mlt_weight_text_{index} with 2-dec precision and update sync
+        proxy_name = get_proxy_prop_name(index)
+        if proxy_name not in getattr(node, "__annotations__", {}):
+            def make_update(idx: int, statkey: str):
+                def _update(self, context):
+                    try:
+                        # Centralized sync: keep text weights in sync with proxies on change
+                        sync_all_stats_proxies_to_text(self)
+                    except Exception:
+                        ...
+                return _update
+            prop = bpy.props.FloatProperty(
+                name="",
+                default=float(default_value),
+                min=MLT_WEIGHT_MIN,
+                max=MLT_WEIGHT_MAX,
+                step=MLT_WEIGHT_STEP,
+                precision=MLT_WEIGHT_PRECISION,
+                soft_min=MLT_WEIGHT_MIN,
+                soft_max=MLT_WEIGHT_MAX,
+                options={'ANIMATABLE'},
+                update=make_update(index, stat_name)
+            )
+            node.__annotations__[proxy_name] = prop
+            setattr(node.__class__, proxy_name, prop)
+        # Initialize instance value
+        try:
+            getattr(node, proxy_name)
+        except Exception:
+            setattr(node, proxy_name, float(default_value))
+        return proxy_name
+    except Exception:
+        return None
+
+
+# In-memory registry: node-pointer -> {stat_name: {uid: slot}}
+_PROXY_SLOT_REGISTRY: dict[int, dict[str, dict[str, int]]] = {}
+
+
+def _get_proxy_map(node) -> dict:
+    key = int(node.as_pointer())
+    if key not in _PROXY_SLOT_REGISTRY:
+        _PROXY_SLOT_REGISTRY[key] = {}
+    return _PROXY_SLOT_REGISTRY[key]
+
+
+def _get_stat_proxy_map(node, stat_name: str) -> dict:
+    pmap = _get_proxy_map(node)
+    if stat_name not in pmap:
+        pmap[stat_name] = {}
+        # Seed from persisted ID properties if available (supports undo/redo and save/load)
+        try:
+            persisted_all = node.get("__MLT_PROXY_MAP__", {})
+            if isinstance(persisted_all, dict) and stat_name in persisted_all:
+                persisted_stat = persisted_all.get(stat_name, {})
+                if isinstance(persisted_stat, dict):
+                    for k, v in persisted_stat.items():
+                        try:
+                            pmap[stat_name][str(k)] = int(v)
+                        except Exception:
+                            ...
+        except Exception:
+            ...
+    return pmap[stat_name]
+
+
+def compute_slot_key(uid: str, index: int) -> str:
+    """Build the slot map key for a text item based on its uid or fallback index."""
+    try:
+        return uid if uid else f"__IDX__{int(index)}"
+    except Exception:
+        return uid or f"__IDX__{index}"
+
+
+def sync_proxies_to_text(node, stat) -> None:
+    """Synchronize visible proxy floats into the text-encoded weights for a given stat.
+
+    - Reads the stable uid->slot map
+    - For each text item, if a proxy exists, applies its rounded value to the item's weight
+    """
+    try:
+        if not stat or not getattr(stat, "texts", None):
+            return
+        slot_map = _get_stat_proxy_map(node, stat.name)
+        for idx, text_item in enumerate(stat.texts):
+            uid = getattr(text_item, "uid", "")
+            key = compute_slot_key(uid, idx)
+            slot = slot_map.get(key)
+            if slot is None:
+                continue
+            pname = get_proxy_prop_name(int(slot))
+            if not hasattr(node, pname):
+                continue
+            try:
+                animated_val = float(getattr(node, pname))
+                animated_val = round(animated_val, MLT_WEIGHT_PRECISION)
+                if abs(float(text_item.get_weight()) - animated_val) > 1e-9:
+                    text_item.set_weight(animated_val)
+            except Exception:
+                ...
+    except Exception:
+        ...
+
+
+def sync_all_stats_proxies_to_text(node) -> None:
+    """Apply proxy->text sync for all active stats on the node."""
+    try:
+        for s in getattr(node, "mlt_stats", []) or []:
+            sync_proxies_to_text(node, s)
+    except Exception:
+        ...
+
+
+def _persist_stat_proxy_map(node, stat_name: str):
+    """Persist the current uid->slot map for a stat into the node ID properties.
+    This makes mappings undo/redo-safe and file-save-safe.
+    """
+    try:
+        slot_map = _get_stat_proxy_map(node, stat_name)
+        if not isinstance(slot_map, dict):
+            return
+        # Only persist real uids; skip temporary index-based keys
+        filtered = {k: int(v) for k, v in slot_map.items() if not str(k).startswith("__IDX__")}
+        if "__MLT_PROXY_MAP__" not in node:
+            node["__MLT_PROXY_MAP__"] = {}
+        persisted_all = node["__MLT_PROXY_MAP__"]
+        if stat_name not in persisted_all:
+            persisted_all[stat_name] = {}
+        # Overwrite
+        persisted_all[stat_name].clear()
+        for k, v in filtered.items():
+            persisted_all[stat_name][k] = int(v)
+    except Exception:
+        ...
+
+
+def _get_persisted_stat_map(node, stat_name: str) -> dict:
+    try:
+        persisted_all = node.get("__MLT_PROXY_MAP__", {})
+        if isinstance(persisted_all, dict) and stat_name in persisted_all:
+            persisted_stat = persisted_all.get(stat_name, {})
+            if isinstance(persisted_stat, dict):
+                # Ensure int values
+                return {str(k): int(v) for k, v in persisted_stat.items()}
+    except Exception:
+        ...
+    return {}
+
+
+def _refresh_stat_proxy_map(node, stat_name: str, items: list | None = None):
+    """Resync in-memory uid->slot map from persisted data or fcurves (for undo/redo)."""
+    try:
+        slot_map = _get_stat_proxy_map(node, stat_name)
+        persisted = _get_persisted_stat_map(node, stat_name)
+        if persisted:
+            # Replace entire map with persisted
+            keys = list(slot_map.keys())
+            for k in keys:
+                slot_map.pop(k)
+            for k, v in persisted.items():
+                slot_map[k] = int(v)
+            return
+        # If nothing persisted and no map yet, try bootstrapping from existing fcurves
+        if not slot_map and items is not None:
+            bootstrap_slot_map_from_fcurves(node, stat_name, items)
+    except Exception:
+        ...
+
+
+def _make_name_key(node, stat_name: str, index: int) -> str:
+    try:
+        stat = node.mlt_stats.get(stat_name)
+        if not stat:
+            return ""
+        if index < 0 or index >= len(stat.texts):
+            return ""
+        name = getattr(stat.texts[index], "name", "")
+        if name == "":
+            return ""
+        # Compute occurrence count of the same name up to current index
+        occ = 0
+        for i in range(0, index + 1):
+            if getattr(stat.texts[i], "name", "") == name:
+                occ += 1
+        return f"__NAME__{name}##{occ}"
+    except Exception:
+        return ""
+
+
+def _find_index_by_uid(node, stat_name: str, uid: str) -> int:
+    try:
+        stat = node.mlt_stats.get(stat_name)
+        if not stat:
+            return -1
+        for i, t in enumerate(stat.texts):
+            if getattr(t, "uid", "") == uid:
+                return i
+    except Exception:
+        ...
+    return -1
+
+
+def _get_node_action(node):
+    tree = getattr(node, "id_data", None) or node.get_tree()
+    if not tree or not getattr(tree, "animation_data", None):
+        return None
+    return tree.animation_data.action
+
+
+def _iter_node_weight_fcurves(node):
+    action = _get_node_action(node)
+    if not action:
+        return
+    node_path = f'nodes["{node.name}"]'
+    for fc in action.fcurves or []:
+        dp = getattr(fc, "data_path", "")
+        if node_path in dp and "mlt_weight_text_" in dp:
+            yield fc
+
+
+def _has_fcurve(node, data_path: str) -> bool:
+    for fc in _iter_node_weight_fcurves(node):
+        if data_path in fc.data_path:
+            return True
+    return False
+
+
+def _remove_fcurve(node, data_path: str):
+    action = _get_node_action(node)
+    if not action:
+        return
+    for fc in list(action.fcurves or []):
+        if data_path in getattr(fc, "data_path", ""):
+            action.fcurves.remove(fc)
+
+
+def _existing_weight_slots(node) -> list[int]:
+    """Collect existing proxy slot indices that currently have f-curves."""
+    slots = set()
+    for fc in _iter_node_weight_fcurves(node):
+        dp = getattr(fc, "data_path", "")
+        try:
+            idx = int(dp.split("mlt_weight_text_")[-1])
+            slots.add(idx)
+        except Exception:
+            ...
+    return sorted(slots)
+
+
+def bootstrap_slot_map_from_fcurves(node, stat_name: str, items: list):
+    """Initialize slot-map for a stat from existing animated slots on file load.
+    Only runs when the map is empty.
+    Strategy: map slot N to item at index N when possible. This avoids shifting
+    animations to earlier items when only higher-index slots exist (e.g. only slot 1)."""
+    slot_map = _get_stat_proxy_map(node, stat_name)
+    if slot_map:
+        return
+    slots = _existing_weight_slots(node)
+    if not slots:
+        return
+    # Prefer 1:1 index mapping when the slot exists for that index
+    for i, item in enumerate(items):
+        if i in slots:
+            uid = getattr(item, "uid", "") or f"__IDX__{i}"
+            if uid not in slot_map:
+                slot_map[uid] = int(i)
+    # Fallback for any remaining unassigned items: assign remaining free slots in order
+    remaining_slots = [s for s in slots if s not in slot_map.values()]
+    if remaining_slots:
+        for i, item in enumerate(items):
+            uid = getattr(item, "uid", "") or f"__IDX__{i}"
+            if uid in slot_map:
+                continue
+            if not remaining_slots:
+                break
+            slot_map[uid] = int(remaining_slots.pop(0))
+    # Persist for stability
+    try:
+        _persist_stat_proxy_map(node, stat_name)
+    except Exception:
+        ...
+
+
+def ensure_slot_for_uid(node, stat_name: str, uid: str, default_value: float, fallback_index: int | None = None) -> int:
+    """Assign or fetch a stable proxy slot for a given uid in a stat.
+    Keeps animation bound to the same word regardless of index changes.
+    """
+    smap = _get_stat_proxy_map(node, stat_name)
+    # Prefer uid
+    key = uid if uid else ""
+    # If no uid, try a name-based stable key with occurrence index
+    if not key and fallback_index is not None:
+        name_key = _make_name_key(node, stat_name, int(fallback_index))
+        if name_key:
+            key = name_key
+    # Last-resort index key
+    if not key:
+        key = f"__IDX__{fallback_index}" if fallback_index is not None else "__NOID__"
+    if key in smap:
+        return int(smap[key])
+    # Find a free slot among 0..63
+    used = set(int(v) for v in smap.values())
+    # Also mark any slots that still have fcurves as used to avoid inheriting orphan animations
+    action = _get_node_action(node)
+    if action:
+        node_path = f'nodes["{node.name}"]'
+        for fc in action.fcurves or []:
+            dp = getattr(fc, "data_path", "")
+            if node_path in dp and "mlt_weight_text_" in dp:
+                try:
+                    used.add(int(dp.split("mlt_weight_text_")[-1]))
+                except Exception:
+                    ...
+    slot = 0
+    while slot in used and slot < 64:
+        slot += 1
+    if slot >= 64:
+        slot = 63
+    smap[key] = slot
+    # Also bind a name-based key for robustness across reloads where UIDs may differ
+    try:
+        if fallback_index is not None:
+            nk = _make_name_key(node, stat_name, int(fallback_index))
+            if nk:
+                smap[nk] = slot
+    except Exception:
+        ...
+    # Do not reset value or f-curves here; keep existing values when toggling UI.
+    # Non-destructive initialization happens during draw if there is no f-curve.
+    # Persist mapping for undo/redo stability
+    _persist_stat_proxy_map(node, stat_name)
+    return slot
+
+
+def release_slot_for_uid(node, stat_name: str, uid: str, fallback_index: int | None = None):
+    smap = _get_stat_proxy_map(node, stat_name)
+    # Try uid key first
+    candidates = []
+    if uid:
+        candidates.append(uid)
+    # Try name-based key for the item at the given index (if still present)
+    if fallback_index is not None:
+        name_key = _make_name_key(node, stat_name, int(fallback_index))
+        if name_key:
+            candidates.append(name_key)
+    # Finally try index-based key
+    candidates.append(f"__IDX__{fallback_index}" if fallback_index is not None else "__NOID__")
+    slot = None
+    for k in candidates:
+        if k in smap:
+            slot = int(smap.pop(k))
+            break
+    if slot is None:
+        return
+    pname = get_proxy_prop_name(slot)
+    _remove_fcurve(node, pname)
+    # Also reset the proxy value to 1.0 so newly added words at the same place start clean
+    try:
+        setattr(node, pname, 1.0)
+    except Exception:
+        ...
+    # Update persistence
+    _persist_stat_proxy_map(node, stat_name)
+
+
+def prune_orphan_proxy_slots(node, stat_name: str, current_uids: list[str]):
+    """Remove any proxy slot assignments and fcurves for uids that are no longer present."""
+    # If we don't know current uids yet (e.g., on startup before sync), do nothing.
+    if not current_uids:
+        return
+    slot_map = _get_stat_proxy_map(node, stat_name)
+    to_remove = []
+    for key in list(slot_map.keys()):
+        # keep only if key matches one of the current uids
+        if key in current_uids:
+            continue
+        to_remove.append(key)
+    for key in to_remove:
+        slot = int(slot_map.pop(key))
+        _remove_fcurve(node, get_proxy_prop_name(slot))
+    # Persist changes for undo/redo
+    _persist_stat_proxy_map(node, stat_name)
+    # Additionally, remove any fcurves that reference slots not present in the current slot_map
+    action = _get_node_action(node)
+    if action:
+        assigned = set(int(v) for v in slot_map.values())
+        # Be conservative: if we don't have any assigned slots yet, skip removal to preserve animations on load
+        if assigned:
+            node_path = f'nodes["{node.name}"]'
+            for fc in list(action.fcurves or []):
+                dp = getattr(fc, "data_path", "")
+                if node_path not in dp or "mlt_weight_text_" not in dp:
+                    continue
+                try:
+                    idx = int(dp.split("mlt_weight_text_")[-1])
+                except Exception:
+                    continue
+                if idx not in assigned:
+                    action.fcurves.remove(fc)
+
+def rebuild_mlt_proxies(node, stat):
+    """Ensure proxies exist for current texts without resetting values or animations."""
+    # Non-destructive: only ensure proxy properties for used indices
+    for i, t in enumerate(stat.texts):
+        ensure_mlt_proxy(node, stat.name, i, float(t.get_weight()))
+
 
 
 def get_node_center(node: bpy.types.Node) -> Vector:
@@ -402,26 +819,60 @@ class PropGen:
                 stat = self.mlt_stats.get(inp_name)
                 if not stat or not stat.enable:
                     return
-                stat.freeze = True
-                rm = False
+                # Refresh from persistence/fcurves at start of edit for undo stability
                 try:
+                    _refresh_stat_proxy_map(self, inp_name, list(stat.texts))
+                except Exception:
+                    ...
+                stat.freeze = True
+                try:
+                    # Rebuild items from edited string with stable UID reuse rules
+                    prev_items = [(t.name, getattr(t, "uid", "")) for t in stat.texts]
+                    prev_uids_by_index = [u for _, u in prev_items]
                     stat.texts.clear()
-                    for text in self[inp_name].split(","):
-                        t = text.strip()
-                        if t in stat.texts:
-                            rm = True
+                    new_parts = [p.rstrip() for p in self[inp_name].split(",")]
+                    reused_uids: set[str] = set()
+                    prev_len = len(prev_items)
+                    new_len = len(new_parts)
+                    # Build duplicate-aware mapping name -> [uids]
+                    name_to_uids: dict[str, list[str]] = {}
+                    for pn, pu in prev_items:
+                        if not pu:
+                            continue
+                        name_to_uids.setdefault(pn, []).append(pu)
+                    for idx, part in enumerate(new_parts):
+                        if part == "":
                             continue
                         i = stat.texts.add()
-                        i.name = t
+                        reuse_uid = ""
+                        # Prefer name-based reuse. Only fall back to index-based when lengths are equal.
+                        if part in name_to_uids and name_to_uids[part]:
+                            candidate = name_to_uids[part][0]
+                            if candidate not in reused_uids:
+                                reuse_uid = candidate
+                                name_to_uids[part].pop(0)
+                        elif new_len == prev_len and idx < len(prev_uids_by_index):
+                            candidate = prev_uids_by_index[idx]
+                            if candidate and candidate not in reused_uids:
+                                reuse_uid = candidate
+                        if reuse_uid:
+                            reused_uids.add(reuse_uid)
+                        i.uid = reuse_uid or str(uuid4())
+                        i.name = part
+                    # Persist mapping for undo/redo
+                    _persist_stat_proxy_map(self, inp_name)
+                    # Release animations for any previous uid that was not reused (true deletions)
+                    try:
+                        prev_uids = [u for _, u in prev_items]
+                        for removed_uid in prev_uids:
+                            if removed_uid and removed_uid not in reused_uids:
+                                release_slot_for_uid(self, inp_name, removed_uid)
+                    except Exception:
+                        ...
                 except Exception:
                     import traceback
                     traceback.print_exc()
                 stat.freeze = False
-                # if rm:
-                #     ct = ",".join([t.name for t in stat.texts])
-                #     if ct == self[inp_name]:
-                #         return
-                #     self[inp_name] = ct
             return wrap
         update_default = update_default_wrap(inp_name)
 
@@ -519,16 +970,14 @@ class MLTText(bpy.types.PropertyGroup):
 
     def set_content(self, v):
         # v format: '[xxx]key'
-        # 如果v已经存在则弹出报错
         if "]" in v:
-            v = v.split("]")[1].strip()
-        node: NodeBase = bpy.context.active_node
-        stat = self.find_stat(node)
-        if stat and v in stat.texts:
-            def pop_error(self, context):
-                self.layout.label(text="Text already exists", icon="ERROR")
-            bpy.context.window_manager.popup_menu(pop_error, title="ERROR", icon="ERROR")
+            v = v.split("]")[1].rstrip()
+        
+        # Don't set empty content
+        if not v or not v.strip():
             return
+            
+        # Allow setting content even if it matches other entries (for weight changes)
         self["name"] = v
 
     def get_content(self):
@@ -542,12 +991,93 @@ class MLTText(bpy.types.PropertyGroup):
         stat = self.find_stat(node)
         if not stat:
             return
-        ct = ",".join([t.name for t in stat.texts])
-        if ct == getattr(node, stat.name):
+        
+        # Prevent recursive updates
+        if hasattr(stat, "_updating_content"):
             return
-        setattr(node, stat.name, ct)
+        stat._updating_content = True
+        
+        try:
+            # If there are no texts, clear the node property
+            if not stat.texts:
+                if getattr(node, stat.name, "").strip():
+                    setattr(node, stat.name, "")
+                return
+                
+            # Filter out empty text entries
+            valid_texts = [t.name for t in stat.texts if t.name and t.name.strip()]
+            
+            # If no valid texts, clear the node property
+            if not valid_texts:
+                if getattr(node, stat.name, "").strip():
+                    setattr(node, stat.name, "")
+                return
+                
+            # Rebuild proxies to stay in sync with current texts length
+            rebuild_mlt_proxies(node, stat)
 
+            ct = ",".join(valid_texts)
+            if ct == getattr(node, stat.name):
+                return
+            setattr(node, stat.name, ct)
+            
+            # No separate weight property to sync; text itself is the source of truth
+        finally:
+            delattr(stat, "_updating_content")
+
+    def get_original_text(self):
+        """Extract original text without weight formatting"""
+        text = self.name
+        # Capture optional leading spaces before parentheses, and the inner text
+        match = re.match(r"^(\s*)\((.*?):(.*?)\)$", text)
+        if match:
+            return match.group(1) + match.group(2)
+        return text.rstrip()
+
+    def get_weight(self):
+        """Get current weight from text or default to 1.0"""
+        text = self.name
+        # Allow optional leading spaces before the weighted token
+        match = re.match(r"^\s*\((.*?):(.*?)\)$", text)
+        if match:
+            try:
+                return float(match.group(2))
+            except ValueError:
+                return 1.0
+        return 1.0
+
+    def set_weight(self, weight):
+        """Set weight by updating the name field"""
+        original_text = self.get_original_text()
+        if not original_text:
+            return
+            
+        # Normalize to 2 decimals to keep UI and prompt consistent
+        weight_rounded = round(weight, 2)
+        if weight_rounded != 1.0:
+            # Preserve leading spaces by placing them before the parentheses
+            leading_ws_match = re.match(r"^(\s*)", original_text)
+            leading_ws = leading_ws_match.group(1) if leading_ws_match else ""
+            core_text = original_text[len(leading_ws):]
+            new_name = f"{leading_ws}({core_text}:{weight_rounded:.2f})"
+        else:
+            new_name = original_text
+        
+        if self.name != new_name:
+            # Update name property to trigger update_content callback
+            self.name = new_name
+
+
+    def update_weight_from_property(self, context):
+        return
+
+    def sync_weight_property(self):
+        return
+
+    # RNA properties for collection item
     name: bpy.props.StringProperty(update=update_content, set=set_content, get=get_content)
+    uid: bpy.props.StringProperty()
+    # Removed: no per-row expand state needed anymore
 
 
 class MLTRec(bpy.types.PropertyGroup):
@@ -560,16 +1090,109 @@ class MLTRec(bpy.types.PropertyGroup):
     def add_text_update(self, context):
         if not self.addtext:
             return
-        t = self.addtext.strip()
+        t = self.addtext.rstrip()
         self.addtext = ""
-        if t not in self.texts:
-            i = self.texts.add()
-            i.name = t
-        else:
-            def pop_error(self, context):
-                self.layout.label(text="Text already exists", icon="ERROR")
-            bpy.context.window_manager.popup_menu(pop_error, title="ERROR", icon="ERROR")
+        # Allow adding duplicate text entries
+        i = self.texts.add()
+        if not getattr(i, "uid", ""):
+            i.uid = str(uuid4())
+        i.name = t
+        # Ensure the proxy for the newly added word is available immediately
+        try:
+            node: NodeBase = get_ctx_node()
+            if node:
+                new_index = len(self.texts) - 1
+                ensure_mlt_proxy(node, self.name, new_index, float(i.get_weight()))
+        except Exception:
+            ...
     addtext: bpy.props.StringProperty(name="Add Tag By Input", update=add_text_update)
+
+    def sync_from_node_text(self, node, prop_name):
+        """Synchronize the texts collection with the node's main text property"""
+        if not hasattr(node, prop_name):
+            return
+        # Refresh slot map from persisted data/fcurves first to keep undo stable
+        try:
+            _refresh_stat_proxy_map(node, prop_name, list(self.texts))
+        except Exception:
+            ...
+        
+        # Snapshot of previous items (order matters for index-based reuse)
+        prev = [(t.name, getattr(t, "uid", "")) for t in self.texts]
+        prev_uids_by_index = [u for _, u in prev]
+        reused_uids: set[str] = set()
+        self.texts.clear()
+        
+        # Get the node's text property and split by commas
+        node_text = getattr(node, prop_name)
+        if not node_text:
+            return
+            
+        # Parse comma-separated text into individual MLTText items (allow duplicates)
+        # Important: we preserve empty entries caused by stray commas so that
+        # index positions remain explicit during this pass. Later we skip empty items.
+        parts = [p.rstrip() for p in node_text.split(",")]
+        new_len = len(parts)
+        prev_len = len(prev)
+        # Build name->uids map to support reuse with duplicates
+        name_to_uids: dict[str, list[str]] = {}
+        for n, u in prev:
+            if not u:
+                continue
+            name_to_uids.setdefault(n, []).append(u)
+        for idx, text in enumerate(parts):
+            i = self.texts.add()
+            reuse_uid = ""
+            # Strategy:
+            # - If lengths differ (insert/delete), avoid index-based reuse to prevent UID sliding
+            #   and only reuse by name.
+            # - If lengths are equal, prefer name-based reuse (handles reorders),
+            #   then fall back to index-based reuse (handles rename-in-place).
+            if text in name_to_uids and name_to_uids[text]:
+                candidate = name_to_uids[text][0]
+                if candidate not in reused_uids:
+                    reuse_uid = candidate
+                    # consume one occurrence
+                    name_to_uids[text].pop(0)
+            elif new_len == prev_len:
+                if idx < len(prev_uids_by_index):
+                    candidate = prev_uids_by_index[idx]
+                    if candidate and candidate not in reused_uids:
+                        reuse_uid = candidate
+            if reuse_uid:
+                reused_uids.add(reuse_uid)
+            i.uid = reuse_uid or str(uuid4())
+            # Keep empty strings as valid items so UI can show empty rows
+            i.name = text
+            # No separate weight property; text stores weight
+        # Release animations for any previous uid that was not reused (true deletions)
+        try:
+            prev_uids = [u for _, u in prev]
+            # Build set of current uids (reused) to protect
+            protected = set(reused_uids)
+            # Also protect any uid that still appears in the rebuilt items
+            for item in self.texts:
+                if getattr(item, "uid", ""):
+                    protected.add(item.uid)
+            for removed_uid in prev_uids:
+                if removed_uid and removed_uid not in protected:
+                    release_slot_for_uid(node, prop_name, removed_uid)
+            # Persist mapping since we changed assignments
+            _persist_stat_proxy_map(node, prop_name)
+        except Exception:
+            ...
+
+    def dump_list_to_node_prop(self, node):
+        """Dump the texts collection back to the node's main text property"""
+        if not hasattr(node, self.name):
+            return
+        
+        # Join all text items with commas; include empties so trailing commas are preserved
+        ct = ",".join([(t.name if t.name is not None else "") for t in self.texts])
+        
+        # Update the node property if it's different
+        if ct != getattr(node, self.name):
+            setattr(node, self.name, ct)
 
 
 class MLTWords_UL_UIList(bpy.types.UIList):
@@ -592,32 +1215,109 @@ class MLTText_UL_UIList(bpy.types.UIList):
                   context: bpy.types.Context,
                   layout: bpy.types.UILayout,
                   data, item, icon, active_data, active_property, index=0, flt_flag=0):
+        
         row = layout.row(align=True)
-        row.label(text="", icon="KEYTYPE_KEYFRAME_VEC")
-        if getattr(data, active_property) == index:
-            row.prop_search(item, "name", bpy.context.window_manager, "mlt_words", text="", results_are_suggestions=True)
-        else:
-            row.label(text=item.name)
 
-        op = row.operator(AdvTextEdit.bl_idname, text="", icon="ADD")
-        op.text_name = item.name
-        op.prop = data.name
-        op.action = "UpTagWeight"
+        # Reorder controls (works across Blender versions even if drag-drop is unavailable)
+        up = row.operator("sdn.mlt_move_text", text="", icon="TRIA_UP")
+        up.prop = data.name
+        up.index = index
+        up.direction = "UP"
+        down = row.operator("sdn.mlt_move_text", text="", icon="TRIA_DOWN")
+        down.prop = data.name
+        down.index = index
+        down.direction = "DOWN"
 
-        op = row.operator(AdvTextEdit.bl_idname, text="", icon="REMOVE")
-        op.text_name = item.name
-        op.prop = data.name
-        op.action = "DownTagWeight"
+        # Removed expand toggle; rows are always inline editable
 
-        op = row.operator(AdvTextEdit.bl_idname, text="", icon="RADIOBUT_OFF")
-        op.text_name = item.name
-        op.prop = data.name
-        op.action = "RemoveTagWeight"
+        # Inline editable text with suggestions (previous behavior)
+        row.prop_search(item, "name", bpy.context.window_manager, "mlt_words", text="", results_are_suggestions=True)
 
+        # Weight control row
+        weight_row = row.row(align=True)
+        weight_row.scale_x = 0.8
+        
+        # Removed weight float; proxy drives text directly
+
+        # Visible animatable proxy on the node using stable slot per uid
+        # Prefer the node being drawn; fall back to active node only if needed
+        node = getattr(context, "node", None) or get_ctx_node()
+        # Try owner id if available (set by draw code) to avoid wrong context in properties sidebar
+        if not node and hasattr(data, "keys"):
+            try:
+                owner_id = data.get("__owner_node_id", "")
+                if owner_id:
+                    # Search in current node tree for matching id
+                    tree = bpy.context.space_data.edit_tree if hasattr(bpy.context, "space_data") else None
+                    if tree:
+                        for n in tree.nodes:
+                            if getattr(n, "id", None) == owner_id:
+                                node = n
+                                break
+            except Exception:
+                ...
+        if node:
+            try:
+                uid = getattr(item, "uid", "")
+                slot = ensure_slot_for_uid(node, data.name, uid, float(item.get_weight()), fallback_index=index)
+                pname = get_proxy_prop_name(slot)
+                # Initialize display value from text weight when no animation exists yet
+                if not _has_fcurve(node, pname):
+                    try:
+                        setattr(node, pname, float(item.get_weight()))
+                    except Exception:
+                        ...
+                weight_row.prop(node, pname, text="")
+                weight_row.prop_decorator(node, pname)
+            except Exception:
+                ...
+        # Remove explicit keyframe buttons; rely on Blender's native keyframe UI
+        
+        # Keep only the remove button (X)
         op = row.operator(AdvTextEdit.bl_idname, text="", icon="X")
         op.text_name = item.name
         op.prop = data.name
         op.action = "RemoveTag"
+
+
+class MoveMLTTextItem(bpy.types.Operator):
+    bl_idname = "sdn.mlt_move_text"
+    bl_label = "Move Text Item"
+    bl_description = "Reorder a text item in the list"
+
+    prop: bpy.props.StringProperty(default="")
+    index: bpy.props.IntProperty(default=0)
+    direction: bpy.props.EnumProperty(items=[("UP", "Up", ""), ("DOWN", "Down", "")], default="UP")
+
+    @classmethod
+    def poll(cls, context):
+        from .tree import TREE_TYPE
+        return context.space_data.type == 'NODE_EDITOR' and context.space_data.tree_type == TREE_TYPE
+
+    def execute(self, context):
+        node: NodeBase = get_ctx_node()
+        if not node:
+            return {'CANCELLED'}
+        stat: MLTRec = node.mlt_stats.get(self.prop)
+        if not stat:
+            return {'CANCELLED'}
+        cur = self.index
+        new = cur - 1 if self.direction == "UP" else cur + 1
+        if new < 0 or new >= len(stat.texts):
+            return {'CANCELLED'}
+        try:
+            stat.texts.move(cur, new)
+            stat.tindex = new
+            # Reflect new order back to node property
+            stat.dump_list_to_node_prop(node)
+        except Exception:
+            ...
+        # Select the new row
+        try:
+            stat.tindex = len(stat.texts) - 1
+        except Exception:
+            ...
+        return {'FINISHED'}
 
 
 class NodeBase(bpy.types.Node):
@@ -881,6 +1581,9 @@ class NodeBase(bpy.types.Node):
 
     def _draw_(self, context, layout, ext=False):
         for prop in self.__annotations__:
+            # Hide internal anim proxy props from the auto UI
+            if prop.startswith("mlt_weight_") or prop.startswith("_mlt_weight_"):
+                continue
             if not ext and not self.get_sock_visible(prop, "INPUT"):
                 continue
             if self.query_stat(prop):
@@ -922,6 +1625,10 @@ class NodeBase(bpy.types.Node):
         tree = self.get_tree()
         if tree.freeze:
             return
+        # Apply animated proxy weights to text weights, frame by frame
+        for stat in self.mlt_stats:
+            sync_proxies_to_text(self, stat)
+        # No longer support legacy hidden proxy
         self.remove_multi_link()
         self.remove_invalid_link()
         self.primitive_check()
@@ -1558,14 +2265,14 @@ class AdvTextEdit(bpy.types.Operator):
     bl_idname = "sdn.adv_text_edit"
     bl_label = ""
     bl_translation_context = ctxt
+    bl_options = {'UNDO'}
     prop: bpy.props.StringProperty(default="")
     text_name: bpy.props.StringProperty(default="")
+    text_index: bpy.props.IntProperty(default=-1)  # Add index parameter for precise targeting
     action: bpy.props.EnumProperty(items=[("SwitchAdvText", "SwitchAdvText", "", 0),
                                           ("RemoveTag", "RemoveTag", "", 1),
                                           ("AddTag", "AddTag", "", 2),
-                                          ("UpTagWeight", "UpTagWeight", "", 3),
-                                          ("DownTagWeight", "DownTagWeight", "", 4),
-                                          ("RemoveTagWeight", "RemoveTagWeight", "", 5),
+                                          ("RemoveTagWeight", "RemoveTagWeight", "", 3),
                                           ],
                                    default="SwitchAdvText")
 
@@ -1594,79 +2301,184 @@ class AdvTextEdit(bpy.types.Operator):
                 stat.enable = True
             else:
                 stat.enable ^= True
-            self.update_list(node, stat)
+            # Sync from node text when enabling the interface
+            if stat.enable:
+                stat.sync_from_node_text(node, self.prop)
         elif self.action == "RemoveTag":
             if stat:
-                tindex = stat.texts.find(self.text_name)
-                stat.texts.remove(tindex)
-                self.dump_list(node, stat)
+                # Use index if provided, otherwise fall back to text name search
+                if self.text_index >= 0 and self.text_index < len(stat.texts):
+                    tindex = self.text_index
+                else:
+                    tindex = stat.texts.find(self.text_name)
+                
+                if tindex >= 0:
+                    try:
+                        node: NodeBase = get_ctx_node()
+                        text_item = stat.texts[tindex]
+                        if getattr(text_item, "uid", ""):
+                            release_slot_for_uid(node, stat.name, text_item.uid)
+                    except Exception:
+                        ...
+                    stat.texts.remove(tindex)
+                    stat.dump_list_to_node_prop(node)
         elif self.action == "AddTag":
             if stat:
-                if self.text_name not in stat.texts:
-                    stat.texts.add().name = self.text_name
-                    self.update_list(node, stat)
-                else:
-                    self.report({"ERROR"}, "Text already exists")
-        elif self.action == "UpTagWeight":
-            if stat and self.text_name in stat.texts:
-                t = self.text_name.strip()
-                # 权重格式 tag -> (tag:xxx), 其中xxx为权重值
-                match = re.match(r"\((.*?):(.*?)\)", t)
-                if match:
-                    ot, weight = match.group(1, 2)
-                    weight = float(weight)
-                else:
-                    ot, weight = t, 1
-                weight += 0.1
-                t = f"({ot}:{weight:.1f})"
-                stat.texts[self.text_name].name = t
-        elif self.action == "DownTagWeight":
-            if stat and self.text_name in stat.texts:
-                t = self.text_name.strip()
-                # 权重格式 tag -> (tag:xxx), 其中xxx为权重值
-                match = re.match(r"\((.*?):(.*?)\)", t)
-                if match:
-                    ot, weight = match.group(1, 2)
-                    weight = float(weight)
-                else:
-                    ot, weight = t, 1
-                weight -= 0.1
-                t = f"({ot}:{weight:.1f})"
-                stat.texts[self.text_name].name = t
+                # Don't add empty text
+                if not self.text_name or not self.text_name.strip():
+                    return
+                # Allow adding duplicate text entries
+                stat.texts.add().name = self.text_name
+                stat.dump_list_to_node_prop(node)
         elif self.action == "RemoveTagWeight":
+            # Reset weight to 1.0
             if stat and self.text_name in stat.texts:
-                t = self.text_name.strip()
-                # 权重格式 tag -> (tag:xxx), 其中xxx为权重值
-                match = re.match(r"\((.*?):(.*?)\)", t)
-                ot = t if not match else match.group(1)
-                stat.texts[self.text_name].name = ot
+                text_item = stat.texts[self.text_name]
+                text_item.set_weight(1.0)
         return {'FINISHED'}
 
-    def dump_list(self, node, stat):
-        if not stat.enable:
-            return
-        if not hasattr(node, stat.name):
-            return
-        ct = ",".join([t.name for t in stat.texts])
-        if ct == getattr(node, stat.name):
-            return
-        setattr(node, stat.name, ct)
-        self.update_list(node, stat)
 
-    def update_list(self, node, stat):
-        if not stat or not node:
-            return
-        stat.texts.clear()
-        rm = False
-        for text in getattr(node, self.prop).split(","):
-            text = text.strip()
-            if not text:
-                rm = True
-                continue
-            i = stat.texts.add()
-            i.name = text.strip()
-        if rm:
-            self.dump_list(node, stat)
+
+
+class MLTAddEmpty(bpy.types.Operator):
+    bl_idname = "sdn.mlt_add_empty"
+    bl_label = "Add empty text item"
+    bl_description = "Add an empty text row to the list"
+
+    prop: bpy.props.StringProperty(default="")
+
+    @classmethod
+    def poll(cls, context):
+        from .tree import TREE_TYPE
+        return context.space_data.type == 'NODE_EDITOR' and context.space_data.tree_type == TREE_TYPE
+
+    def execute(self, context):
+        node: NodeBase = getattr(context, "node", None) or get_ctx_node()
+        if not node:
+            return {'CANCELLED'}
+        stat: MLTRec = node.mlt_stats.get(self.prop)
+        if not stat:
+            return {'CANCELLED'}
+        # Persist: append a trailing comma if needed, preserving empty token
+        try:
+            cur = getattr(node, self.prop)
+            if not cur:
+                setattr(node, self.prop, ",")
+            else:
+                if not cur.endswith(","):
+                    setattr(node, self.prop, cur + ",")
+        except Exception:
+            ...
+        # Re-sync collection from property so an empty token turns into a list item
+        try:
+            stat.sync_from_node_text(node, self.prop)
+            rebuild_mlt_proxies(node, stat)
+        except Exception:
+            ...
+        # Select the new row
+        try:
+            stat.tindex = len(stat.texts) - 1
+        except Exception:
+            ...
+        return {'FINISHED'}
+
+class InsertWeightKeyframe(bpy.types.Operator):
+    bl_idname = "sdn.insert_weight_keyframe"
+    bl_label = "Insert Weight Keyframe"
+    bl_translation_context = ctxt
+
+    node_name: bpy.props.StringProperty(default="")
+    prop: bpy.props.StringProperty(default="")
+    text_index: bpy.props.IntProperty(default=0)
+
+    @classmethod
+    def poll(cls, context):
+        from .tree import TREE_TYPE
+        return context.space_data.type == 'NODE_EDITOR' and context.space_data.tree_type == TREE_TYPE
+
+    def execute(self, context):
+        node: NodeBase = get_ctx_node()
+        if not node:
+            return {'CANCELLED'}
+        stat: MLTRec = node.mlt_stats.get(self.prop)
+        if not stat:
+            return {'CANCELLED'}
+        if self.text_index < 0 or self.text_index >= len(stat.texts):
+            return {'CANCELLED'}
+        # Allocate a stable proxy slot for this item's uid and keyframe that slot
+        text_item = stat.texts[self.text_index]
+        slot = ensure_slot_for_uid(node, self.prop, getattr(text_item, "uid", ""), float(text_item.get_weight()), fallback_index=self.text_index)
+        proxy_name = get_proxy_prop_name(slot)
+        # Set current value from text weight
+        try:
+            setattr(node, proxy_name, float(text_item.get_weight()))
+        except Exception:
+            ...
+        # Insert keyframe on node proxy property (node action path)
+        try:
+            action = _get_node_action(node)
+            if action is None:
+                node.keyframe_insert(data_path=f"{proxy_name}")
+            else:
+                data_path = f'nodes["{node.name}"].{proxy_name}'
+                action.fcurves.new(data_path=data_path, index=0)
+        except Exception:
+            ...
+        return {'FINISHED'}
+
+
+class DeleteWeightKeyframe(bpy.types.Operator):
+    bl_idname = "sdn.delete_weight_keyframe"
+    bl_label = "Delete Weight Keyframe"
+    bl_translation_context = ctxt
+
+    node_name: bpy.props.StringProperty(default="")
+    prop: bpy.props.StringProperty(default="")
+    text_index: bpy.props.IntProperty(default=0)
+
+    @classmethod
+    def poll(cls, context):
+        from .tree import TREE_TYPE
+        return context.space_data.type == 'NODE_EDITOR' and context.space_data.tree_type == TREE_TYPE
+
+    def execute(self, context):
+        node: NodeBase = get_ctx_node()
+        if not node:
+            return {'CANCELLED'}
+        stat: MLTRec = node.mlt_stats.get(self.prop)
+        if not stat or self.text_index < 0 or self.text_index >= len(stat.texts):
+            return {'CANCELLED'}
+        text_item = stat.texts[self.text_index]
+        # Release slot and remove its fcurve
+        try:
+            release_slot_for_uid(node, self.prop, getattr(text_item, "uid", ""), fallback_index=self.text_index)
+        except Exception:
+            ...
+        return {'FINISHED'}
+
+class SetMLTActiveIndex(bpy.types.Operator):
+    bl_idname = "sdn.set_mlt_active_index"
+    bl_label = "Set MLT Active Index"
+    bl_translation_context = ctxt
+    
+    prop: bpy.props.StringProperty(default="")
+    index: bpy.props.IntProperty(default=0)
+    
+    @classmethod
+    def poll(cls, context):
+        from .tree import TREE_TYPE
+        return context.space_data.type == 'NODE_EDITOR' and context.space_data.tree_type == TREE_TYPE
+    
+    def execute(self, context):
+        node: NodeBase = get_ctx_node()
+        if not node:
+            return {"FINISHED"}
+        
+        stat: MLTRec = node.mlt_stats.get(self.prop)
+        if stat and 0 <= self.index < len(stat.texts):
+            stat.tindex = self.index
+        
+        return {'FINISHED'}
 
 
 class NodeParser:
@@ -1993,6 +2805,16 @@ class NodeParser:
                     # out.link_limit = 0
                     out.index = index
                 self.calc_slot_index()
+                # Default: enable advanced text UI for CLIPTextEncode on new nodes
+                if self.class_type == "CLIPTextEncode":
+                    try:
+                        stat = self.mlt_stats.get("text")
+                        if not stat:
+                            stat = self.mlt_stats.add()
+                            stat.name = "text"
+                        stat.enable = True
+                    except Exception:
+                        ...
 
             def validate_inp(inp):
                 if not isinstance(inp, list):
@@ -2044,6 +2866,31 @@ class NodeParser:
 
             bp.extra_properties(properties, nname, ndesc)
             # spec_extra_properties(properties, nname, ndesc)
+            # Predeclare animatable proxy floats for CLIPTextEncode so Blender RNA knows them
+            if nname == "CLIPTextEncode":
+                # Update callback: central sync (avoid duplicating logic here)
+                def _make_proxy_update(_i: int):
+                    def _update(self, context):
+                        try:
+                            sync_all_stats_proxies_to_text(self)
+                        except Exception:
+                            ...
+                    return _update
+                for _idx in range(64):  # supports up to 64 prompt parts per node
+                    pname = get_proxy_prop_name(_idx)
+                    if pname not in properties:
+                        properties[pname] = bpy.props.FloatProperty(
+                            name="",
+                            default=1.0,
+                            min=MLT_WEIGHT_MIN,
+                            max=MLT_WEIGHT_MAX,
+                            step=MLT_WEIGHT_STEP,
+                            precision=MLT_WEIGHT_PRECISION,
+                            soft_min=MLT_WEIGHT_MIN,
+                            soft_max=MLT_WEIGHT_MAX,
+                            options={'ANIMATABLE'},
+                            update=_make_proxy_update(_idx)
+                        )
             fields = {
                 "init": init,
                 "inp_types": inp_types,
@@ -2138,7 +2985,16 @@ class Images(bpy.types.PropertyGroup):
     image: bpy.props.PointerProperty(type=bpy.types.Image)
 
 
-clss = [SDNConfig, MLTText, MLTRec, MLTWords_UL_UIList, MLTText_UL_UIList, Ops_Switch_Socket_Disp, Ops_Switch_Socket_Widget, Ops_Add_SaveImage, Set_Render_Res, GetSelCol, AdvTextEdit, Ops_Active_Tex, Ops_Link_Mask, Images]
+class MLT_REPLACE_WORDS_UL_UIList(bpy.types.UIList):
+    """Deprecated list (kept for compatibility); no operators used anymore"""
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index=0, flt_flag=0):
+        layout.label(text=item.value)
+
+
+
+
+
+clss = [SDNConfig, MLTText, MLTRec, MLTWords_UL_UIList, MLTText_UL_UIList, MoveMLTTextItem, Ops_Switch_Socket_Disp, Ops_Switch_Socket_Widget, Ops_Add_SaveImage, Set_Render_Res, GetSelCol, AdvTextEdit, MLTAddEmpty, SetMLTActiveIndex, InsertWeightKeyframe, DeleteWeightKeyframe, Ops_Active_Tex, Ops_Link_Mask, Images, MLT_REPLACE_WORDS_UL_UIList]
 
 reg, unreg = bpy.utils.register_classes_factory(clss)
 

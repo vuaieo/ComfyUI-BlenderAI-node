@@ -3555,6 +3555,107 @@ class SDParameterGenerator(BluePrintBase):
             widgets_values.pop(rm)
 
 
+class CLIPTextEncode(BluePrintBase):
+    comfyClass = "CLIPTextEncode"
+
+    def serialize_pre_specific(s, self: NodeBase):
+        # Ensure current-frame proxy values are baked into the text before execution
+        try:
+            stat = self.mlt_stats.get("text")
+            if not stat or not stat.texts:
+                return
+            from .nodes import bootstrap_slot_map_from_fcurves, sync_proxies_to_text
+            # Make sure slot map exists on freshly loaded files
+            bootstrap_slot_map_from_fcurves(self, stat.name, stat.texts)
+            # Centralized sync from proxies to text
+            sync_proxies_to_text(self, stat)
+            # Write back to node property so diff detects a change
+            stat.dump_list_to_node_prop(self)
+        except Exception:
+            ...
+
+    def draw_button(s, self: NodeBase, context: Context, layout: UILayout, prop: str, swsock=True, swdisp=False):
+        # Handle the text property specifically
+        if prop == "text":
+            # Draw the text property normally first
+            row = draw_prop_with_link(layout, self, prop, swsock, swdisp)
+            
+            # Add the enable mlt button
+            row.operator("sdn.enable_mlt", text="", icon="TEXT")
+            
+            # Add the paste clipboard button
+            op = row.operator("sdn.paste_clipboard_to_mlt", text="", icon="PASTEDOWN")
+            op.socket_name = prop
+            
+            # Add the SwitchAdvText button after the other buttons
+            stat = self.mlt_stats.get(prop)
+            enable = bool(stat and stat.enable)
+            op = row.operator("sdn.adv_text_edit", text="", icon="OPTIONS", depress=enable)
+            op.prop = prop
+            op.action = "SwitchAdvText"
+            
+            # Show the multiline text interface if enabled
+            if enable:
+                # If enabled but list not yet built (e.g., after toggle), sync via timer to avoid UI draw context writes
+                try:
+                    if stat and not len(stat.texts):
+                        import bpy as _bpy
+                        def _sync_once():
+                            try:
+                                # Re-fetch node to be safe
+                                n = self
+                                s = n.mlt_stats.get(prop)
+                                if s is not None:
+                                    s.sync_from_node_text(n, prop)
+                            except Exception:
+                                ...
+                            return None
+                        _bpy.app.timers.register(_sync_once, first_interval=0.0)
+                except Exception:
+                    ...
+                # Get window manager (needed for both suggestions and prompt entries)
+                mgr = bpy.context.window_manager
+                
+                # Show add tag input and suggestions only in properties panel (when swdisp=True)
+                if swdisp:
+                    # Add new prompt input field
+                    add_row = layout.row(align=True)
+                    add_row.prop(stat, "addtext", icon="ADD", text="")
+                    
+                    # Show suggestions
+                    suggestions_box = layout.box()
+                    suggestions_box.label(text="Suggestions", icon="VIEWZOOM")
+                    suggestions_box.prop(bpy.context.scene.sdn, "search_tag", icon="VIEWZOOM", text="")
+                    suggestions_box.template_list("MLTWords_UL_UIList", prop, mgr, "mlt_words", mgr, "mlt_words_index")
+                
+                # Display each prompt entry as a separate input field
+                if True:
+                    # Before drawing, prune any orphaned slot assignments so new items don't inherit old animations
+                    try:
+                        # First, if loading a file, rebuild slot map from any existing f-curves
+                        from .nodes import prune_orphan_proxy_slots, bootstrap_slot_map_from_fcurves
+                        # Do not prune immediately after text edits; just ensure slot map
+                        bootstrap_slot_map_from_fcurves(self, stat.name, stat.texts)
+                    except Exception:
+                        ...
+                    # Tag owner node id so the list can resolve the correct node context
+                    try:
+                        stat["__owner_node_id"] = self.id
+                    except Exception:
+                        ...
+                    # Use an integrated UIList that provides reorder/expand/replace controls
+                    layout.template_list("MLTText_UL_UIList", "", stat, "texts", stat, "tindex")
+                    # Add-Empty button below list
+                    add_list_row = layout.row(align=True)
+                    op = add_list_row.operator("sdn.mlt_add_empty", text="", icon="ADD")
+                    op.prop = stat.name
+            # Always consume drawing for 'text' so the base implementation doesn't add another input
+            return True
+        
+        # For other properties, use the default behavior
+        return super().draw_button(self, context, layout, prop, swsock, swdisp)
+
+
 @lru_cache(maxsize=1024)
 def get_blueprints(comfyClass="", default=BluePrintBase) -> BluePrintBase:
     for cls in BluePrintBase.__subclasses__():
