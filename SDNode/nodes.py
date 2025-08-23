@@ -1240,35 +1240,42 @@ class MLTText_UL_UIList(bpy.types.UIList):
         # Removed weight float; proxy drives text directly
 
         # Visible animatable proxy on the node using stable slot per uid
-        # Prefer the node being drawn; fall back to active node only if needed
-        node = getattr(context, "node", None) or get_ctx_node()
-        # Try owner id if available (set by draw code) to avoid wrong context in properties sidebar
-        if not node and hasattr(data, "keys"):
-            try:
+        # Prefer the actual owner node (tagged during draw), then the node being drawn, then active
+        node = None
+        try:
+            if hasattr(data, "get"):
                 owner_id = data.get("__owner_node_id", "")
                 if owner_id:
-                    # Search in current node tree for matching id
-                    tree = bpy.context.space_data.edit_tree if hasattr(bpy.context, "space_data") else None
+                    tree = getattr(getattr(context, "space_data", None), "edit_tree", None) or getattr(getattr(bpy.context, "space_data", None), "edit_tree", None)
                     if tree:
                         for n in tree.nodes:
                             if getattr(n, "id", None) == owner_id:
                                 node = n
                                 break
-            except Exception:
-                ...
-        if node:
+        except Exception:
+            ...
+        if not node:
+            node = getattr(context, "node", None) or get_ctx_node()
+        if node and getattr(node, "class_type", "") == "CLIPTextEncode":
             try:
                 uid = getattr(item, "uid", "")
                 slot = ensure_slot_for_uid(node, data.name, uid, float(item.get_weight()), fallback_index=index)
                 pname = get_proxy_prop_name(slot)
-                # Initialize display value from text weight when no animation exists yet
-                if not _has_fcurve(node, pname):
+                # Ensure proxy property exists for this slot on the CLIPTextEncode node
+                if not hasattr(node, pname):
                     try:
-                        setattr(node, pname, float(item.get_weight()))
+                        ensure_mlt_proxy(node, data.name, slot, float(item.get_weight()))
                     except Exception:
                         ...
-                weight_row.prop(node, pname, text="")
-                weight_row.prop_decorator(node, pname)
+                # Initialize display value from text weight when no animation exists yet
+                if hasattr(node, pname):
+                    if not _has_fcurve(node, pname):
+                        try:
+                            setattr(node, pname, float(item.get_weight()))
+                        except Exception:
+                            ...
+                    weight_row.prop(node, pname, text="")
+                    weight_row.prop_decorator(node, pname)
             except Exception:
                 ...
         # Remove explicit keyframe buttons; rely on Blender's native keyframe UI
