@@ -1581,6 +1581,13 @@ class NodeBase(bpy.types.Node):
             def f(self: NodeBase, name):
                 self.name = name
             Timer.put((f, self, name))
+        
+        # Regenerate UIDs for all text items to prevent cross-node interference
+        for stat in self.mlt_stats:
+            if hasattr(stat, "texts"):
+                for text_item in stat.texts:
+                    if hasattr(text_item, "uid"):
+                        text_item.uid = str(uuid4())
 
     def apply_unique_id(self):
         self.id = self.unique_id()
