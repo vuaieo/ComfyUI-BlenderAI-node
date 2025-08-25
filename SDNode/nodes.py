@@ -2882,6 +2882,13 @@ class NodeParser:
             # spec_extra_properties(properties, nname, ndesc)
             # Predeclare animatable proxy floats for CLIPTextEncode so Blender RNA knows them
             if nname == "CLIPTextEncode":
+                # Add randomize words property
+                properties["randomize_words"] = bpy.props.BoolProperty(
+                    name="Randomize Words", 
+                    description="Randomize word order in text prompts",
+                    default=False
+                )
+                
                 # Update callback: central sync (avoid duplicating logic here)
                 def _make_proxy_update(_i: int):
                     def _update(self, context):

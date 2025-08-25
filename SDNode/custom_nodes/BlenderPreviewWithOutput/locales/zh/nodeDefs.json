@@ -1,0 +1,30 @@
+{
+  "PreviewImageWithOutput": {
+    "display_name": "预览图像 (带输出)",
+    "description": "在预览中显示图像并将它们输出以供其他节点使用",
+    "inputs": {
+      "images": {
+        "name": "图像",
+        "type": "IMAGE",
+        "tooltip": "要预览和输出的图像"
+      },
+      "filename_prefix": {
+        "name": "文件名前缀",
+        "type": "STRING",
+        "tooltip": "临时文件名的前缀"
+      },
+      "output_dir": {
+        "name": "输出目录",
+        "type": "STRING",
+        "tooltip": "输出目录路径"
+      }
+    },
+    "outputs": {
+      "0": {
+        "name": "图像",
+        "type": "IMAGE",
+        "tooltip": "相同的图像可供其他节点使用"
+      }
+    }
+  }
+}

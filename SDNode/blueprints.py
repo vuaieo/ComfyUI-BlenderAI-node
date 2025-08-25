@@ -1277,9 +1277,8 @@ class 预览(BluePrintBase):
             return True
 
     def serialize_pre_specific(s, self: NodeBase):
-        if self.inputs[0].is_linked:
-            return
-        self.prev.clear()
+        # Do not clear previews during serialization; keep existing previews even if unlinked
+        return
 
     def post_fn(s, self: NodeBase, t: Task, result):
         logger.debug("%s%s->%s", self.class_type, _T('Post Function'), result)
@@ -1370,9 +1369,8 @@ class PreviewImage(BluePrintBase):
             return True
 
     def serialize_pre_specific(s, self: NodeBase):
-        if self.inputs[0].is_linked:
-            return
-        self.prev.clear()
+        # Keep previews even if unlinked; do not clear on serialize
+        return
 
     def post_fn(s, self: NodeBase, t: Task, result):
         logger.debug("%s%s->%s", self.class_type, _T('Post Function'), result)
@@ -3557,6 +3555,92 @@ class SDParameterGenerator(BluePrintBase):
 
 class CLIPTextEncode(BluePrintBase):
     comfyClass = "CLIPTextEncode"
+
+    def serialize(s, self: NodeBase, execute=True, parent: NodeBase = None):
+        print(f"CLIPTextEncode.serialize called - execute={execute}")  # Debug
+        
+        # Apply list randomization if enabled - shuffle before serialization  
+        print(f"Checking randomize_words: hasattr={hasattr(self, 'randomize_words')}")  # Debug
+        if hasattr(self, 'randomize_words'):
+            print(f"randomize_words value: {self.randomize_words}")  # Debug
+        
+        if hasattr(self, 'randomize_words') and self.randomize_words:
+            import random
+            import time
+            print("Randomization is enabled, attempting to shuffle...")  # Debug
+            try:
+                stat = self.mlt_stats.get("text")
+                if stat and stat.texts and len(stat.texts) > 1:
+                    # Create list of indices
+                    indices = list(range(len(stat.texts)))
+                    original_indices = indices.copy()
+                    print(f"Original indices: {original_indices}")  # Debug
+                    
+                    # Get previous shuffle order (stored as node attribute)
+                    previous_order = getattr(self, '_last_shuffle_order', original_indices)
+                    print(f"Previous order: {previous_order}")  # Debug
+                    
+                    # Generate new shuffle order that's different from previous
+                    max_attempts = 100
+                    attempts = 0
+                    new_order = original_indices.copy()
+                    
+                    # For 2 items, just reverse if same as previous
+                    if len(indices) == 2:
+                        if previous_order == original_indices:
+                            new_order = [1, 0]
+                        else:
+                            new_order = [0, 1]
+                    else:
+                        # For more than 2 items, keep trying until different
+                        while new_order == previous_order and attempts < max_attempts:
+                            # Use time-based seed to ensure different results
+                            seed = int(time.time() * 1000000) + attempts
+                            random.seed(seed)
+                            new_order = original_indices.copy()
+                            random.shuffle(new_order)
+                            attempts += 1
+                            
+                        # Fallback: if still same after max attempts, manually swap first two
+                        if new_order == previous_order:
+                            new_order[0], new_order[1] = new_order[1], new_order[0]
+                    
+                    # Store the new order for next time
+                    self._last_shuffle_order = new_order.copy()
+                    indices = new_order
+                    print(f"New shuffled indices: {indices} (attempts: {attempts})")  # Debug
+                    
+                    # Simple approach: Create new list in shuffled order
+                    original_items = []
+                    for item in stat.texts:
+                        original_items.append({
+                            'name': item.name,
+                            'uid': getattr(item, 'uid', '')
+                        })
+                    
+                    # Clear and rebuild in shuffled order
+                    stat.texts.clear()
+                    for i in indices:
+                        new_item = stat.texts.add()
+                        new_item.name = original_items[i]['name']
+                        if original_items[i]['uid']:
+                            new_item.uid = original_items[i]['uid']
+                    
+                    # Update node property to reflect new order
+                    stat.dump_list_to_node_prop(self)
+                    print("List order randomized successfully")  # Debug
+                else:
+                    print("No stat or insufficient text items for randomization")  # Debug
+                    
+            except Exception as e:
+                print(f"Randomization error: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("Randomization not enabled or property not found")  # Debug
+        
+        # Call parent method
+        return super().serialize(self, execute, parent)
 
     def serialize_pre_specific(s, self: NodeBase):
         # Ensure current-frame proxy values are baked into the text before execution

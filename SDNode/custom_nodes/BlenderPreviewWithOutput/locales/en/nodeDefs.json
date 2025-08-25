@@ -1,0 +1,30 @@
+{
+  "PreviewImageWithOutput": {
+    "display_name": "Preview Image (with Output)",
+    "description": "Displays images in the preview and outputs them for use by other nodes",
+    "inputs": {
+      "images": {
+        "name": "images",
+        "type": "IMAGE",
+        "tooltip": "The images to preview and output"
+      },
+      "filename_prefix": {
+        "name": "filename_prefix",
+        "type": "STRING",
+        "tooltip": "Prefix for temporary filenames"
+      },
+      "output_dir": {
+        "name": "output_dir",
+        "type": "STRING",
+        "tooltip": "Output directory path"
+      }
+    },
+    "outputs": {
+      "0": {
+        "name": "IMAGE",
+        "type": "IMAGE",
+        "tooltip": "The same images available for other nodes"
+      }
+    }
+  }
+}
