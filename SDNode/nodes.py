@@ -827,38 +827,42 @@ class PropGen:
                 stat.freeze = True
                 try:
                     # Rebuild items from edited string with stable UID reuse rules
-                    prev_items = [(t.name, getattr(t, "uid", "")) for t in stat.texts]
-                    prev_uids_by_index = [u for _, u in prev_items]
+                    prev_items = [(t.name, getattr(t, "uid", ""), getattr(t, "enable_shuffling", True)) for t in stat.texts]
+                    prev_uids_by_index = [u for _, u, _ in prev_items]
                     stat.texts.clear()
                     new_parts = [p.rstrip() for p in self[inp_name].split(",")]
                     reused_uids: set[str] = set()
                     prev_len = len(prev_items)
                     new_len = len(new_parts)
-                    # Build duplicate-aware mapping name -> [uids]
-                    name_to_uids: dict[str, list[str]] = {}
-                    for pn, pu in prev_items:
+                    # Build duplicate-aware mapping name -> [(uid, enable_shuffling)]
+                    name_to_data: dict[str, list[tuple[str, bool]]] = {}
+                    for pn, pu, pe in prev_items:
                         if not pu:
                             continue
-                        name_to_uids.setdefault(pn, []).append(pu)
+                        name_to_data.setdefault(pn, []).append((pu, pe))
                     for idx, part in enumerate(new_parts):
                         if part == "":
                             continue
                         i = stat.texts.add()
                         reuse_uid = ""
+                        reuse_enable_shuffling = True  # Default
                         # Prefer name-based reuse. Only fall back to index-based when lengths are equal.
-                        if part in name_to_uids and name_to_uids[part]:
-                            candidate = name_to_uids[part][0]
-                            if candidate not in reused_uids:
-                                reuse_uid = candidate
-                                name_to_uids[part].pop(0)
-                        elif new_len == prev_len and idx < len(prev_uids_by_index):
-                            candidate = prev_uids_by_index[idx]
-                            if candidate and candidate not in reused_uids:
-                                reuse_uid = candidate
+                        if part in name_to_data and name_to_data[part]:
+                            candidate_uid, candidate_enable = name_to_data[part][0]
+                            if candidate_uid not in reused_uids:
+                                reuse_uid = candidate_uid
+                                reuse_enable_shuffling = candidate_enable
+                                name_to_data[part].pop(0)
+                        elif new_len == prev_len and idx < len(prev_items):
+                            _, candidate_uid, candidate_enable = prev_items[idx]
+                            if candidate_uid and candidate_uid not in reused_uids:
+                                reuse_uid = candidate_uid
+                                reuse_enable_shuffling = candidate_enable
                         if reuse_uid:
                             reused_uids.add(reuse_uid)
                         i.uid = reuse_uid or str(uuid4())
                         i.name = part
+                        i.enable_shuffling = reuse_enable_shuffling
                     # Persist mapping for undo/redo
                     _persist_stat_proxy_map(self, inp_name)
                     # Release animations for any previous uid that was not reused (true deletions)
@@ -955,6 +959,12 @@ class SDNConfig(bpy.types.PropertyGroup):
 
 
 class MLTText(bpy.types.PropertyGroup):
+    enable_shuffling: bpy.props.BoolProperty(
+        name="Enable Shuffling",
+        description="Allow this text item to be shuffled during randomization",
+        default=True
+    )
+    
     def find_stat(self, node: NodeBase):
         if not node:
             return
@@ -1118,8 +1128,8 @@ class MLTRec(bpy.types.PropertyGroup):
             ...
         
         # Snapshot of previous items (order matters for index-based reuse)
-        prev = [(t.name, getattr(t, "uid", "")) for t in self.texts]
-        prev_uids_by_index = [u for _, u in prev]
+        prev = [(t.name, getattr(t, "uid", ""), getattr(t, "enable_shuffling", True)) for t in self.texts]
+        prev_uids_by_index = [u for _, u, _ in prev]
         reused_uids: set[str] = set()
         self.texts.clear()
         
@@ -1134,40 +1144,44 @@ class MLTRec(bpy.types.PropertyGroup):
         parts = [p.rstrip() for p in node_text.split(",")]
         new_len = len(parts)
         prev_len = len(prev)
-        # Build name->uids map to support reuse with duplicates
-        name_to_uids: dict[str, list[str]] = {}
-        for n, u in prev:
+        # Build name->data map to support reuse with duplicates
+        name_to_data: dict[str, list[tuple[str, bool]]] = {}
+        for n, u, e in prev:
             if not u:
                 continue
-            name_to_uids.setdefault(n, []).append(u)
+            name_to_data.setdefault(n, []).append((u, e))
         for idx, text in enumerate(parts):
             i = self.texts.add()
             reuse_uid = ""
+            reuse_enable_shuffling = True  # Default
             # Strategy:
             # - If lengths differ (insert/delete), avoid index-based reuse to prevent UID sliding
             #   and only reuse by name.
             # - If lengths are equal, prefer name-based reuse (handles reorders),
             #   then fall back to index-based reuse (handles rename-in-place).
-            if text in name_to_uids and name_to_uids[text]:
-                candidate = name_to_uids[text][0]
-                if candidate not in reused_uids:
-                    reuse_uid = candidate
+            if text in name_to_data and name_to_data[text]:
+                candidate_uid, candidate_enable = name_to_data[text][0]
+                if candidate_uid not in reused_uids:
+                    reuse_uid = candidate_uid
+                    reuse_enable_shuffling = candidate_enable
                     # consume one occurrence
-                    name_to_uids[text].pop(0)
+                    name_to_data[text].pop(0)
             elif new_len == prev_len:
-                if idx < len(prev_uids_by_index):
-                    candidate = prev_uids_by_index[idx]
-                    if candidate and candidate not in reused_uids:
-                        reuse_uid = candidate
+                if idx < len(prev):
+                    _, candidate_uid, candidate_enable = prev[idx]
+                    if candidate_uid and candidate_uid not in reused_uids:
+                        reuse_uid = candidate_uid
+                        reuse_enable_shuffling = candidate_enable
             if reuse_uid:
                 reused_uids.add(reuse_uid)
             i.uid = reuse_uid or str(uuid4())
             # Keep empty strings as valid items so UI can show empty rows
             i.name = text
+            i.enable_shuffling = reuse_enable_shuffling
             # No separate weight property; text stores weight
         # Release animations for any previous uid that was not reused (true deletions)
         try:
-            prev_uids = [u for _, u in prev]
+            prev_uids = [u for _, u, _ in prev]
             # Build set of current uids (reused) to protect
             protected = set(reused_uids)
             # Also protect any uid that still appears in the rebuilt items
@@ -1217,6 +1231,12 @@ class MLTText_UL_UIList(bpy.types.UIList):
                   data, item, icon, active_data, active_property, index=0, flt_flag=0):
         
         row = layout.row(align=True)
+
+        # Enable shuffling toggle button (left of up/down arrows) - only show when randomize_words is enabled
+        node = get_ctx_node()
+        randomize_enabled = node.get("randomize_words", False) if node else False
+        if randomize_enabled:
+            row.prop(item, "enable_shuffling", text="", icon="FORCE_TURBULENCE")
 
         # Reorder controls (works across Blender versions even if drag-drop is unavailable)
         up = row.operator("sdn.mlt_move_text", text="", icon="TRIA_UP")
@@ -2495,6 +2515,24 @@ class SetMLTActiveIndex(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SDN_OT_ToggleRandomizeWords(bpy.types.Operator):
+    """Toggle randomize words for this CLIPTextEncode node instance"""
+    bl_idname = "sdn.toggle_randomize_words"
+    bl_label = "Toggle Randomize Words"
+    
+    def execute(self, context):
+        node: NodeBase = get_ctx_node()
+        if not node or node.class_type != "CLIPTextEncode":
+            return {'CANCELLED'}
+        
+        # Toggle the instance-specific randomize_words setting
+        current_state = node.get("randomize_words", False)
+        node["randomize_words"] = not current_state
+        print(f"Node {node.name}: randomize_words toggled to {not current_state}")
+        
+        return {'FINISHED'}
+
+
 class NodeParser:
     CACHED_OBJECT_INFO = {}
     SOCKET_TYPE = {}  # NodeType: {PropName: SocketType}
@@ -2882,12 +2920,7 @@ class NodeParser:
             # spec_extra_properties(properties, nname, ndesc)
             # Predeclare animatable proxy floats for CLIPTextEncode so Blender RNA knows them
             if nname == "CLIPTextEncode":
-                # Add randomize words property
-                properties["randomize_words"] = bpy.props.BoolProperty(
-                    name="Randomize Words", 
-                    description="Randomize word order in text prompts",
-                    default=False
-                )
+                pass  # randomize_words now stored per-instance in node data
                 
                 # Update callback: central sync (avoid duplicating logic here)
                 def _make_proxy_update(_i: int):
@@ -3015,7 +3048,7 @@ class MLT_REPLACE_WORDS_UL_UIList(bpy.types.UIList):
 
 
 
-clss = [SDNConfig, MLTText, MLTRec, MLTWords_UL_UIList, MLTText_UL_UIList, MoveMLTTextItem, Ops_Switch_Socket_Disp, Ops_Switch_Socket_Widget, Ops_Add_SaveImage, Set_Render_Res, GetSelCol, AdvTextEdit, MLTAddEmpty, SetMLTActiveIndex, InsertWeightKeyframe, DeleteWeightKeyframe, Ops_Active_Tex, Ops_Link_Mask, Images, MLT_REPLACE_WORDS_UL_UIList]
+clss = [SDNConfig, MLTText, MLTRec, MLTWords_UL_UIList, MLTText_UL_UIList, MoveMLTTextItem, Ops_Switch_Socket_Disp, Ops_Switch_Socket_Widget, Ops_Add_SaveImage, Set_Render_Res, GetSelCol, AdvTextEdit, MLTAddEmpty, SetMLTActiveIndex, InsertWeightKeyframe, DeleteWeightKeyframe, Ops_Active_Tex, Ops_Link_Mask, Images, MLT_REPLACE_WORDS_UL_UIList, SDN_OT_ToggleRandomizeWords]
 
 reg, unreg = bpy.utils.register_classes_factory(clss)
 

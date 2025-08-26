@@ -3560,82 +3560,128 @@ class CLIPTextEncode(BluePrintBase):
         print(f"CLIPTextEncode.serialize called - execute={execute}")  # Debug
         
         # Apply list randomization if enabled - shuffle before serialization  
-        print(f"Checking randomize_words: hasattr={hasattr(self, 'randomize_words')}")  # Debug
-        if hasattr(self, 'randomize_words'):
-            print(f"randomize_words value: {self.randomize_words}")  # Debug
+        randomize_enabled = self.get("randomize_words", False)
+        print(f"Checking randomize_words: {randomize_enabled}")  # Debug
         
-        if hasattr(self, 'randomize_words') and self.randomize_words:
-            import random
-            import time
-            print("Randomization is enabled, attempting to shuffle...")  # Debug
-            try:
-                stat = self.mlt_stats.get("text")
-                if stat and stat.texts and len(stat.texts) > 1:
-                    # Create list of indices
-                    indices = list(range(len(stat.texts)))
-                    original_indices = indices.copy()
-                    print(f"Original indices: {original_indices}")  # Debug
-                    
-                    # Get previous shuffle order (stored as node attribute)
-                    previous_order = getattr(self, '_last_shuffle_order', original_indices)
-                    print(f"Previous order: {previous_order}")  # Debug
-                    
-                    # Generate new shuffle order that's different from previous
-                    max_attempts = 100
-                    attempts = 0
-                    new_order = original_indices.copy()
-                    
-                    # For 2 items, just reverse if same as previous
-                    if len(indices) == 2:
-                        if previous_order == original_indices:
-                            new_order = [1, 0]
-                        else:
-                            new_order = [0, 1]
-                    else:
-                        # For more than 2 items, keep trying until different
-                        while new_order == previous_order and attempts < max_attempts:
-                            # Use time-based seed to ensure different results
-                            seed = int(time.time() * 1000000) + attempts
-                            random.seed(seed)
+        if randomize_enabled:
+            # Check if node has both input AND output connections
+            has_input_connection = False
+            has_output_connection = False
+            
+            for input_socket in self.inputs:
+                if input_socket.is_linked:
+                    has_input_connection = True
+                    break
+            
+            for output_socket in self.outputs:
+                if output_socket.is_linked:
+                    has_output_connection = True
+                    break
+            
+            is_fully_connected = has_input_connection and has_output_connection
+            
+            if not is_fully_connected:
+                print(f"Node not fully connected (input: {has_input_connection}, output: {has_output_connection}), skipping randomization")  # Debug
+            else:
+                import random
+                import time
+                print("Randomization is enabled and node is connected, attempting to shuffle...")  # Debug
+                try:
+                    stat = self.mlt_stats.get("text")
+                    if stat and stat.texts and len(stat.texts) > 1:
+                        # Create list of indices
+                        indices = list(range(len(stat.texts)))
+                        original_indices = indices.copy()
+                        print(f"Original indices: {original_indices}")  # Debug
+                        
+                        # Get previous shuffle order (stored as node attribute)
+                        previous_order = getattr(self, '_last_shuffle_order', original_indices)
+                        print(f"Previous order: {previous_order}")  # Debug
+                        
+                        # Get shuffleable indices (only items with enable_shuffling=True)
+                        shuffleable_indices = []
+                        fixed_indices = []
+                        for i, item in enumerate(stat.texts):
+                            if getattr(item, 'enable_shuffling', True):
+                                shuffleable_indices.append(i)
+                            else:
+                                fixed_indices.append(i)
+                        
+                        print(f"Shuffleable indices: {shuffleable_indices}")  # Debug
+                        print(f"Fixed indices: {fixed_indices}")  # Debug
+                        
+                        # Only shuffle if we have shuffleable items
+                        if len(shuffleable_indices) > 1:
+                            # Generate new shuffle order that's different from previous
+                            max_attempts = 100
+                            attempts = 0
                             new_order = original_indices.copy()
-                            random.shuffle(new_order)
-                            attempts += 1
                             
-                        # Fallback: if still same after max attempts, manually swap first two
-                        if new_order == previous_order:
-                            new_order[0], new_order[1] = new_order[1], new_order[0]
-                    
-                    # Store the new order for next time
-                    self._last_shuffle_order = new_order.copy()
-                    indices = new_order
-                    print(f"New shuffled indices: {indices} (attempts: {attempts})")  # Debug
-                    
-                    # Simple approach: Create new list in shuffled order
-                    original_items = []
-                    for item in stat.texts:
-                        original_items.append({
-                            'name': item.name,
-                            'uid': getattr(item, 'uid', '')
-                        })
-                    
-                    # Clear and rebuild in shuffled order
-                    stat.texts.clear()
-                    for i in indices:
-                        new_item = stat.texts.add()
-                        new_item.name = original_items[i]['name']
-                        if original_items[i]['uid']:
-                            new_item.uid = original_items[i]['uid']
-                    
-                    # Update node property to reflect new order
-                    stat.dump_list_to_node_prop(self)
-                    print("List order randomized successfully")  # Debug
-                else:
-                    print("No stat or insufficient text items for randomization")  # Debug
-                    
-            except Exception as e:
-                print(f"Randomization error: {e}")
-                import traceback
-                traceback.print_exc()
+                            # For 2 shuffleable items, just swap them
+                            if len(shuffleable_indices) == 2:
+                                # Swap the two shuffleable positions
+                                idx1, idx2 = shuffleable_indices
+                                new_order[idx1], new_order[idx2] = new_order[idx2], new_order[idx1]
+                            else:
+                                # For more than 2 shuffleable items, keep trying until different
+                                while new_order == previous_order and attempts < max_attempts:
+                                    # Use time-based seed to ensure different results
+                                    seed = int(time.time() * 1000000) + attempts
+                                    random.seed(seed)
+                                    new_order = original_indices.copy()
+                                    
+                                    # Only shuffle the shuffleable positions
+                                    shuffleable_values = [new_order[i] for i in shuffleable_indices]
+                                    random.shuffle(shuffleable_values)
+                                    for i, idx in enumerate(shuffleable_indices):
+                                        new_order[idx] = shuffleable_values[i]
+                                    
+                                    attempts += 1
+                                    
+                                # Fallback: if still same after max attempts, swap first two shuffleable
+                                if new_order == previous_order and len(shuffleable_indices) >= 2:
+                                    idx1, idx2 = shuffleable_indices[0], shuffleable_indices[1]
+                                    new_order[idx1], new_order[idx2] = new_order[idx2], new_order[idx1]
+                            
+                            # Store the new order for next time
+                            self._last_shuffle_order = new_order.copy()
+                            indices = new_order
+                        else:
+                            print("No shuffleable items or only one item to shuffle")  # Debug
+                            indices = original_indices
+                        print(f"New shuffled indices: {indices} (attempts: {attempts})")  # Debug
+                        
+                        # Simple approach: Create new list in shuffled order
+                        original_items = []
+                        for idx, item in enumerate(stat.texts):
+                            enable_shuffling_state = getattr(item, 'enable_shuffling', True)
+                            print(f"Backing up item {idx}: '{item.name}' enable_shuffling={enable_shuffling_state}")  # Debug
+                            original_items.append({
+                                'name': item.name,
+                                'uid': getattr(item, 'uid', ''),
+                                'enable_shuffling': enable_shuffling_state
+                            })
+                        
+                        # Clear and rebuild in shuffled order
+                        stat.texts.clear()
+                        for new_idx, original_idx in enumerate(indices):
+                            new_item = stat.texts.add()
+                            new_item.name = original_items[original_idx]['name']
+                            if original_items[original_idx]['uid']:
+                                new_item.uid = original_items[original_idx]['uid']
+                            new_item.enable_shuffling = original_items[original_idx]['enable_shuffling']
+                            print(f"Restored item {new_idx}: '{new_item.name}' enable_shuffling={new_item.enable_shuffling}")  # Debug
+                        
+                        # Update node property to reflect new order
+                        stat.dump_list_to_node_prop(self)
+                        print("List order randomized successfully")  # Debug
+                    else:
+                        print("No stat or insufficient text items for randomization")  # Debug
+                        
+                except Exception as e:
+                    print(f"Randomization error: {e}")
+                    import traceback
+                    traceback.print_exc()
         else:
             print("Randomization not enabled or property not found")  # Debug
         
@@ -3680,6 +3726,10 @@ class CLIPTextEncode(BluePrintBase):
             
             # Show the multiline text interface if enabled
             if enable:
+                # Add randomize button before the list when advanced text is enabled
+                randomize_row = layout.row(align=True)
+                randomize_enabled = self.get("randomize_words", False)
+                op = randomize_row.operator("sdn.toggle_randomize_words", text="", icon="FORCE_TURBULENCE", depress=randomize_enabled)
                 # If enabled but list not yet built (e.g., after toggle), sync via timer to avoid UI draw context writes
                 try:
                     if stat and not len(stat.texts):
