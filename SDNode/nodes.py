@@ -827,47 +827,51 @@ class PropGen:
                 stat.freeze = True
                 try:
                     # Rebuild items from edited string with stable UID reuse rules
-                    prev_items = [(t.name, getattr(t, "uid", ""), getattr(t, "enable_shuffling", True)) for t in stat.texts]
-                    prev_uids_by_index = [u for _, u, _ in prev_items]
+                    prev_items = [(t.name, getattr(t, "uid", ""), getattr(t, "enable_shuffling", True), getattr(t, "enable_randomization", True)) for t in stat.texts]
+                    prev_uids_by_index = [u for _, u, _, _ in prev_items]
                     stat.texts.clear()
                     new_parts = [p.rstrip() for p in self[inp_name].split(",")]
                     reused_uids: set[str] = set()
                     prev_len = len(prev_items)
                     new_len = len(new_parts)
-                    # Build duplicate-aware mapping name -> [(uid, enable_shuffling)]
-                    name_to_data: dict[str, list[tuple[str, bool]]] = {}
-                    for pn, pu, pe in prev_items:
+                    # Build duplicate-aware mapping name -> [(uid, enable_shuffling, enable_randomization)]
+                    name_to_data: dict[str, list[tuple[str, bool, bool]]] = {}
+                    for pn, pu, pe, pr in prev_items:
                         if not pu:
                             continue
-                        name_to_data.setdefault(pn, []).append((pu, pe))
+                        name_to_data.setdefault(pn, []).append((pu, pe, pr))
                     for idx, part in enumerate(new_parts):
                         if part == "":
                             continue
                         i = stat.texts.add()
                         reuse_uid = ""
                         reuse_enable_shuffling = True  # Default
+                        reuse_enable_randomization = True  # Default
                         # Prefer name-based reuse. Only fall back to index-based when lengths are equal.
                         if part in name_to_data and name_to_data[part]:
-                            candidate_uid, candidate_enable = name_to_data[part][0]
+                            candidate_uid, candidate_enable, candidate_randomization = name_to_data[part][0]
                             if candidate_uid not in reused_uids:
                                 reuse_uid = candidate_uid
                                 reuse_enable_shuffling = candidate_enable
+                                reuse_enable_randomization = candidate_randomization
                                 name_to_data[part].pop(0)
                         elif new_len == prev_len and idx < len(prev_items):
-                            _, candidate_uid, candidate_enable = prev_items[idx]
+                            _, candidate_uid, candidate_enable, candidate_randomization = prev_items[idx]
                             if candidate_uid and candidate_uid not in reused_uids:
                                 reuse_uid = candidate_uid
                                 reuse_enable_shuffling = candidate_enable
+                                reuse_enable_randomization = candidate_randomization
                         if reuse_uid:
                             reused_uids.add(reuse_uid)
                         i.uid = reuse_uid or str(uuid4())
                         i.name = part
                         i.enable_shuffling = reuse_enable_shuffling
+                        i.enable_randomization = reuse_enable_randomization
                     # Persist mapping for undo/redo
                     _persist_stat_proxy_map(self, inp_name)
                     # Release animations for any previous uid that was not reused (true deletions)
                     try:
-                        prev_uids = [u for _, u in prev_items]
+                        prev_uids = [u for _, u, _, _ in prev_items]
                         for removed_uid in prev_uids:
                             if removed_uid and removed_uid not in reused_uids:
                                 release_slot_for_uid(self, inp_name, removed_uid)
@@ -963,6 +967,18 @@ class MLTText(bpy.types.PropertyGroup):
         name="Enable Shuffling",
         description="Allow this text item to be shuffled during randomization",
         default=True
+    )
+
+    enable_randomization: bpy.props.BoolProperty(
+        name="Allow Randomization",
+        description="Allow this text item's weight to be randomized",
+        default=True
+    )
+
+    previous_weight: bpy.props.FloatProperty(
+        name="Previous Weight",
+        description="Stores the weight from the previous randomization to ensure changes",
+        default=1.0
     )
     
     def find_stat(self, node: NodeBase):
@@ -1096,6 +1112,13 @@ class MLTRec(bpy.types.PropertyGroup):
     texts: bpy.props.CollectionProperty(type=MLTText)
     tindex: bpy.props.IntProperty(default=0)
     freeze: bpy.props.BoolProperty(default=False)
+    # Store Limit Items state when SwitchAdvText is disabled
+    saved_enable_max_items: bpy.props.BoolProperty(default=False)
+    saved_max_items_limit: bpy.props.IntProperty(default=10)
+    # Store Randomize Text state when SwitchAdvText is disabled
+    saved_randomize_text: bpy.props.BoolProperty(default=False)
+    # Store weight values when SwitchAdvText is disabled
+    saved_weight_values: bpy.props.StringProperty(default="")
 
     def add_text_update(self, context):
         if not self.addtext:
@@ -1128,8 +1151,8 @@ class MLTRec(bpy.types.PropertyGroup):
             ...
         
         # Snapshot of previous items (order matters for index-based reuse)
-        prev = [(t.name, getattr(t, "uid", ""), getattr(t, "enable_shuffling", True)) for t in self.texts]
-        prev_uids_by_index = [u for _, u, _ in prev]
+        prev = [(t.name, getattr(t, "uid", ""), getattr(t, "enable_shuffling", True), getattr(t, "enable_randomization", True)) for t in self.texts]
+        prev_uids_by_index = [u for _, u, _, _ in prev]
         reused_uids: set[str] = set()
         self.texts.clear()
         
@@ -1145,43 +1168,47 @@ class MLTRec(bpy.types.PropertyGroup):
         new_len = len(parts)
         prev_len = len(prev)
         # Build name->data map to support reuse with duplicates
-        name_to_data: dict[str, list[tuple[str, bool]]] = {}
-        for n, u, e in prev:
+        name_to_data: dict[str, list[tuple[str, bool, bool]]] = {}
+        for n, u, e, r in prev:
             if not u:
                 continue
-            name_to_data.setdefault(n, []).append((u, e))
+            name_to_data.setdefault(n, []).append((u, e, r))
         for idx, text in enumerate(parts):
             i = self.texts.add()
             reuse_uid = ""
             reuse_enable_shuffling = True  # Default
+            reuse_enable_randomization = True  # Default
             # Strategy:
             # - If lengths differ (insert/delete), avoid index-based reuse to prevent UID sliding
             #   and only reuse by name.
             # - If lengths are equal, prefer name-based reuse (handles reorders),
             #   then fall back to index-based reuse (handles rename-in-place).
             if text in name_to_data and name_to_data[text]:
-                candidate_uid, candidate_enable = name_to_data[text][0]
+                candidate_uid, candidate_enable, candidate_randomization = name_to_data[text][0]
                 if candidate_uid not in reused_uids:
                     reuse_uid = candidate_uid
                     reuse_enable_shuffling = candidate_enable
+                    reuse_enable_randomization = candidate_randomization
                     # consume one occurrence
                     name_to_data[text].pop(0)
             elif new_len == prev_len:
                 if idx < len(prev):
-                    _, candidate_uid, candidate_enable = prev[idx]
+                    _, candidate_uid, candidate_enable, candidate_randomization = prev[idx]
                     if candidate_uid and candidate_uid not in reused_uids:
                         reuse_uid = candidate_uid
                         reuse_enable_shuffling = candidate_enable
+                        reuse_enable_randomization = candidate_randomization
             if reuse_uid:
                 reused_uids.add(reuse_uid)
             i.uid = reuse_uid or str(uuid4())
             # Keep empty strings as valid items so UI can show empty rows
             i.name = text
             i.enable_shuffling = reuse_enable_shuffling
+            i.enable_randomization = reuse_enable_randomization
             # No separate weight property; text stores weight
         # Release animations for any previous uid that was not reused (true deletions)
         try:
-            prev_uids = [u for _, u, _ in prev]
+            prev_uids = [u for _, u, _, _ in prev]
             # Build set of current uids (reused) to protect
             protected = set(reused_uids)
             # Also protect any uid that still appears in the rebuilt items
@@ -1200,13 +1227,48 @@ class MLTRec(bpy.types.PropertyGroup):
         """Dump the texts collection back to the node's main text property"""
         if not hasattr(node, self.name):
             return
-        
+
         # Join all text items with commas; include empties so trailing commas are preserved
         ct = ",".join([(t.name if t.name is not None else "") for t in self.texts])
-        
+
         # Update the node property if it's different
         if ct != getattr(node, self.name):
             setattr(node, self.name, ct)
+
+    def save_weight_values(self, node):
+        """Save all current mlt_weight_text_* values"""
+        weight_values = {}
+
+        # Find all mlt_weight_text properties on the node
+        for prop_name in dir(node):
+            if prop_name.startswith("mlt_weight_text_"):
+                try:
+                    weight_values[prop_name] = float(getattr(node, prop_name, 1.0))
+                except (ValueError, TypeError):
+                    weight_values[prop_name] = 1.0
+
+        # Store as JSON string
+        self.saved_weight_values = json.dumps(weight_values)
+
+    def restore_weight_values(self, node):
+        """Restore saved mlt_weight_text_* values"""
+        if not self.saved_weight_values:
+            return
+
+        try:
+            weight_values = json.loads(self.saved_weight_values)
+            for prop_name, value in weight_values.items():
+                if hasattr(node, prop_name):
+                    setattr(node, prop_name, float(value))
+        except (json.JSONDecodeError, ValueError):
+            # If there's an error, just continue without restoring
+            pass
+
+    def reset_weight_values_to_default(self, node):
+        """Reset all mlt_weight_text_* values to 1.00"""
+        for prop_name in dir(node):
+            if prop_name.startswith("mlt_weight_text_"):
+                setattr(node, prop_name, 1.0)
 
 
 class MLTWords_UL_UIList(bpy.types.UIList):
@@ -1229,39 +1291,11 @@ class MLTText_UL_UIList(bpy.types.UIList):
                   context: bpy.types.Context,
                   layout: bpy.types.UILayout,
                   data, item, icon, active_data, active_property, index=0, flt_flag=0):
-        
-        row = layout.row(align=True)
 
-        # Enable shuffling toggle button (left of up/down arrows) - only show when randomize_words is enabled
-        node = get_ctx_node()
-        randomize_enabled = node.get("randomize_words", False) if node else False
-        if randomize_enabled:
-            row.prop(item, "enable_shuffling", text="", icon="FORCE_TURBULENCE")
-
-        # Reorder controls (works across Blender versions even if drag-drop is unavailable)
-        up = row.operator("sdn.mlt_move_text", text="", icon="TRIA_UP")
-        up.prop = data.name
-        up.index = index
-        up.direction = "UP"
-        down = row.operator("sdn.mlt_move_text", text="", icon="TRIA_DOWN")
-        down.prop = data.name
-        down.index = index
-        down.direction = "DOWN"
-
-        # Removed expand toggle; rows are always inline editable
-
-        # Inline editable text with suggestions (previous behavior)
-        row.prop_search(item, "name", bpy.context.window_manager, "mlt_words", text="", results_are_suggestions=True)
-
-        # Weight control row
-        weight_row = row.row(align=True)
-        weight_row.scale_x = 0.8
-        
-        # Removed weight float; proxy drives text directly
-
-        # Visible animatable proxy on the node using stable slot per uid
-        # Prefer the actual owner node (tagged during draw), then the node being drawn, then active
-        node = None
+        # Get the max items setting to determine if this item should be greyed out
+        weight_node = None
+        max_items_limit = 100  # Default to 100 (use all items)
+        enable_max_items = False
         try:
             if hasattr(data, "get"):
                 owner_id = data.get("__owner_node_id", "")
@@ -1270,38 +1304,110 @@ class MLTText_UL_UIList(bpy.types.UIList):
                     if tree:
                         for n in tree.nodes:
                             if getattr(n, "id", None) == owner_id:
-                                node = n
+                                weight_node = n
                                 break
         except Exception:
             ...
-        if not node:
-            node = getattr(context, "node", None) or get_ctx_node()
-        if node and getattr(node, "class_type", "") == "CLIPTextEncode":
+        if not weight_node:
+            weight_node = getattr(context, "node", None) or get_ctx_node()
+
+        if weight_node:
+            enable_max_items = weight_node.get("enable_max_items", False)
+            if enable_max_items:
+                max_items_limit = weight_node.get("max_items_limit", 10)
+
+        # Check if this item should be greyed out (beyond max_items limit and max items is enabled)
+        is_greyed_out = enable_max_items and index >= max_items_limit
+
+        row = layout.row(align=True)
+
+        # Enable shuffling toggle button (left of up/down arrows) - only show when randomize_words is enabled
+        node = get_ctx_node()
+        randomize_words_enabled = node.get("randomize_words", False) if node else False
+        if randomize_words_enabled:
+            shuffle_row = row.row(align=True)
+            shuffle_row.enabled = not is_greyed_out
+            shuffle_row.prop(item, "enable_shuffling", text="", icon="FORCE_TURBULENCE")
+
+        # Reorder controls (works across Blender versions even if drag-drop is unavailable)
+        reorder_row = row.row(align=True)
+        reorder_row.enabled = not is_greyed_out
+        up = reorder_row.operator("sdn.mlt_move_text", text="", icon="TRIA_UP")
+        up.prop = data.name
+        up.index = index
+        up.direction = "UP"
+        down = reorder_row.operator("sdn.mlt_move_text", text="", icon="TRIA_DOWN")
+        down.prop = data.name
+        down.index = index
+        down.direction = "DOWN"
+
+        # Removed expand toggle; rows are always inline editable
+
+        # Inline editable text with suggestions (previous behavior)
+        text_row = row.row(align=True)
+        text_row.enabled = not is_greyed_out
+        text_row.prop_search(item, "name", bpy.context.window_manager, "mlt_words", text="", results_are_suggestions=True)
+
+        # Weight control row
+        weight_row = row.row(align=True)
+        weight_row.scale_x = 0.8
+        weight_row.enabled = not is_greyed_out
+
+        # Use the weight_node we already found earlier for the grey-out logic
+        if not weight_node:  # This should be the same weight_node from earlier
+            try:
+                if hasattr(data, "get"):
+                    owner_id = data.get("__owner_node_id", "")
+                    if owner_id:
+                        tree = getattr(getattr(context, "space_data", None), "edit_tree", None) or getattr(getattr(bpy.context, "space_data", None), "edit_tree", None)
+                        if tree:
+                            for n in tree.nodes:
+                                if getattr(n, "id", None) == owner_id:
+                                    weight_node = n
+                                    break
+            except Exception:
+                ...
+            if not weight_node:
+                weight_node = getattr(context, "node", None) or get_ctx_node()
+
+        if weight_node and getattr(weight_node, "class_type", "") == "CLIPTextEncode":
             try:
                 uid = getattr(item, "uid", "")
-                slot = ensure_slot_for_uid(node, data.name, uid, float(item.get_weight()), fallback_index=index)
+                slot = ensure_slot_for_uid(weight_node, data.name, uid, float(item.get_weight()), fallback_index=index)
                 pname = get_proxy_prop_name(slot)
                 # Ensure proxy property exists for this slot on the CLIPTextEncode node
-                if not hasattr(node, pname):
+                if not hasattr(weight_node, pname):
                     try:
-                        ensure_mlt_proxy(node, data.name, slot, float(item.get_weight()))
+                        ensure_mlt_proxy(weight_node, data.name, slot, float(item.get_weight()))
                     except Exception:
                         ...
                 # Initialize display value from text weight when no animation exists yet
-                if hasattr(node, pname):
-                    if not _has_fcurve(node, pname):
+                if hasattr(weight_node, pname):
+                    if not _has_fcurve(weight_node, pname):
                         try:
-                            setattr(node, pname, float(item.get_weight()))
+                            setattr(weight_node, pname, float(item.get_weight()))
                         except Exception:
                             ...
-                    weight_row.prop(node, pname, text="")
-                    weight_row.prop_decorator(node, pname)
+
+                    # Enable randomization toggle button (left of weight input) - only show when randomize_weights is enabled
+                    randomize_weights_enabled = weight_node.get("randomize_weights", False) if weight_node else False
+                    if randomize_weights_enabled:
+                        rand_row = weight_row.row(align=True)
+                        rand_row.enabled = not is_greyed_out
+                        rand_row.prop(item, "enable_randomization", text="", icon="RNDCURVE")
+
+                    weight_input_row = weight_row.row(align=True)
+                    weight_input_row.enabled = not is_greyed_out
+                    weight_input_row.prop(weight_node, pname, text="")
+                    weight_input_row.prop_decorator(weight_node, pname)
             except Exception:
                 ...
         # Remove explicit keyframe buttons; rely on Blender's native keyframe UI
-        
+
         # Keep only the remove button (X)
-        op = row.operator(AdvTextEdit.bl_idname, text="", icon="X")
+        remove_row = row.row(align=True)
+        remove_row.enabled = not is_greyed_out
+        op = remove_row.operator(AdvTextEdit.bl_idname, text="", icon="X")
         op.text_name = item.name
         op.prop = data.name
         op.action = "RemoveTag"
@@ -2332,9 +2438,55 @@ class AdvTextEdit(bpy.types.Operator):
             if not stat:
                 stat = node.mlt_stats.add()
                 stat.name = self.prop
-                stat.enable = True
+                stat.enable = False  # Start disabled by default
             else:
+                # Before toggling, handle Limit Items and Randomize Text state
+                current_limit_enabled = node.get("enable_max_items", False)
+                current_limit_value = node.get("max_items_limit", 10)
+                current_randomize_text = node.get("randomize_words", False)  # Use actual property name
+
+                if stat.enable:  # If currently enabled, we're about to disable it
+                    # Save current states before disabling
+                    stat.saved_enable_max_items = current_limit_enabled
+                    stat.saved_max_items_limit = current_limit_value
+                    stat.saved_randomize_text = current_randomize_text
+
+                    # BEFORE disabling anything, sync the full list back to text field
+                    # This ensures all items are preserved when Limit Items gets disabled
+                    stat.dump_list_to_node_prop(node)
+
+                    # Save current weight values before resetting them
+                    stat.save_weight_values(node)
+
+                    # Reset all weight values to default (1.00)
+                    stat.reset_weight_values_to_default(node)
+
+                    # Reset Max Items Limit to default BEFORE disabling Limit Items
+                    if hasattr(node, "max_items_limit"):
+                        node["max_items_limit"] = 10  # Reset to default first
+
+                    # Disable features if they were enabled
+                    if current_limit_enabled:
+                        node["enable_max_items"] = False
+                    if current_randomize_text:
+                        node["randomize_words"] = False  # Use actual property name
+                else:  # If currently disabled, we're about to enable it
+                    # Restore Max Items Limit value first
+                    if hasattr(node, "max_items_limit") and stat.saved_enable_max_items:
+                        node["max_items_limit"] = stat.saved_max_items_limit
+
+                    # Then restore the enabled states
+                    if stat.saved_enable_max_items:
+                        node["enable_max_items"] = stat.saved_enable_max_items
+                    if stat.saved_randomize_text:
+                        node["randomize_words"] = stat.saved_randomize_text  # Use actual property name
+
+                    # Finally restore the saved weight values
+                    stat.restore_weight_values(node)
+
+                # Toggle the SwitchAdvText state
                 stat.enable ^= True
+
             # Sync from node text when enabling the interface
             if stat.enable:
                 stat.sync_from_node_text(node, self.prop)
@@ -2511,24 +2663,6 @@ class SetMLTActiveIndex(bpy.types.Operator):
         stat: MLTRec = node.mlt_stats.get(self.prop)
         if stat and 0 <= self.index < len(stat.texts):
             stat.tindex = self.index
-        
-        return {'FINISHED'}
-
-
-class SDN_OT_ToggleRandomizeWords(bpy.types.Operator):
-    """Toggle randomize words for this CLIPTextEncode node instance"""
-    bl_idname = "sdn.toggle_randomize_words"
-    bl_label = "Toggle Randomize Words"
-    
-    def execute(self, context):
-        node: NodeBase = get_ctx_node()
-        if not node or node.class_type != "CLIPTextEncode":
-            return {'CANCELLED'}
-        
-        # Toggle the instance-specific randomize_words setting
-        current_state = node.get("randomize_words", False)
-        node["randomize_words"] = not current_state
-        print(f"Node {node.name}: randomize_words toggled to {not current_state}")
         
         return {'FINISHED'}
 
@@ -2857,14 +2991,14 @@ class NodeParser:
                     # out.link_limit = 0
                     out.index = index
                 self.calc_slot_index()
-                # Default: enable advanced text UI for CLIPTextEncode on new nodes
+                # Default: disable advanced text UI for CLIPTextEncode on new nodes
                 if self.class_type == "CLIPTextEncode":
                     try:
                         stat = self.mlt_stats.get("text")
                         if not stat:
                             stat = self.mlt_stats.add()
                             stat.name = "text"
-                        stat.enable = True
+                        stat.enable = False  # Start disabled by default
                     except Exception:
                         ...
 
@@ -2920,8 +3054,260 @@ class NodeParser:
             # spec_extra_properties(properties, nname, ndesc)
             # Predeclare animatable proxy floats for CLIPTextEncode so Blender RNA knows them
             if nname == "CLIPTextEncode":
-                pass  # randomize_words now stored per-instance in node data
-                
+                # UI bridge for per-instance randomize_words stored in ID properties
+                def _get_randomize_words(self):
+                    try:
+                        return bool(self.get("randomize_words", False))
+                    except Exception:
+                        return False
+                def _set_randomize_words(self, value):
+                    try:
+                        self["randomize_words"] = bool(value)
+                    except Exception:
+                        ...
+                if "Randomize Text" not in properties:
+                    properties["Randomize Text"] = bpy.props.BoolProperty(
+                        name="Randomize Text",
+                        description=(
+                            "Shuffle items with 'enable shuffling' checked each time this node runs "
+                            "when both an input and an output socket are connected."
+                        ),
+                        get=_get_randomize_words,
+                        set=_set_randomize_words,
+                    )
+
+                # UI bridge for per-instance randomize_weights stored in ID properties
+                def _get_randomize_weights(self):
+                    try:
+                        return bool(self.get("randomize_weights", False))
+                    except Exception:
+                        return False
+
+                def _set_randomize_weights(self, value):
+                    try:
+                        self["randomize_weights"] = bool(value)
+                    except Exception:
+                        ...
+
+                def _get_weight_min(self):
+                    try:
+                        return float(self.get("weight_min", MLT_WEIGHT_MIN))
+                    except Exception:
+                        return MLT_WEIGHT_MIN
+
+                def _set_weight_min(self, value):
+                    try:
+                        self["weight_min"] = float(value)
+                    except Exception:
+                        ...
+
+                def _get_weight_max(self):
+                    try:
+                        return float(self.get("weight_max", MLT_WEIGHT_MAX))
+                    except Exception:
+                        return MLT_WEIGHT_MAX
+
+                def _set_weight_max(self, value):
+                    try:
+                        self["weight_max"] = float(value)
+                    except Exception:
+                        ...
+
+                def _get_enable_max_items(self):
+                    try:
+                        return bool(self.get("enable_max_items", False))
+                    except Exception:
+                        return False
+
+                def _set_enable_max_items(self, value):
+                    try:
+                        self["enable_max_items"] = bool(value)
+                    except Exception:
+                        ...
+
+                def _update_enable_max_items(self, context):
+                    """Update callback for enable max items - restores full text when disabled"""
+                    try:
+                        # If disabling max items, restore the full text from the list
+                        if not self.get("enable_max_items", False):
+                            stat = self.mlt_stats.get("text")
+                            if stat:
+                                stat.dump_list_to_node_prop(self)
+                                print("Max items disabled - restored full text")  # Debug
+                    except Exception as e:
+                        print(f"Enable max items update error: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+                def _get_max_items_limit(self):
+                    try:
+                        return int(self.get("max_items_limit", 10))
+                    except Exception:
+                        return 10
+
+                def _set_max_items_limit(self, value):
+                    try:
+                        self["max_items_limit"] = int(value)
+                    except Exception:
+                        ...
+
+
+
+                def _update_randomize_weights(self, context):
+                    """Update callback for randomize weights - handles UI state management only"""
+                    try:
+                        is_enabled = self.get("randomize_weights", False)
+                        print(f"Randomize Weights checkbox toggled: enabled={is_enabled}")  # Debug
+
+                        # If randomization is disabled, also disable full range weights
+                        if not is_enabled:
+                            if self.get("full_range_weights", False):
+                                self["full_range_weights"] = False
+                                print("Full Range Weights automatically disabled because Randomize Weights was disabled")  # Debug
+
+                                # Clean up stored original values since full range is disabled
+                                if "_original_weight_min" in self:
+                                    del self["_original_weight_min"]
+                                if "_original_weight_max" in self:
+                                    del self["_original_weight_max"]
+                                print("Cleaned up stored original weight values")  # Debug
+
+                        # Note: Actual randomization only happens during node execution (serialize method)
+                        # This callback only handles UI state management
+                    except Exception as e:
+                        print(f"Randomize Weights update error: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+                def _update_weight_range(self, context):
+                    """Update callback for weight min/max - validates range and updates UI state"""
+                    try:
+                        # Validate that min is less than max
+                        weight_min = self.get("weight_min", MLT_WEIGHT_MIN)
+                        weight_max = self.get("weight_max", MLT_WEIGHT_MAX)
+
+                        if weight_min >= weight_max:
+                            # Reset to default range if invalid
+                            self["weight_min"] = MLT_WEIGHT_MIN
+                            self["weight_max"] = MLT_WEIGHT_MAX
+                            print(f"Invalid weight range detected, reset to defaults: {MLT_WEIGHT_MIN} to {MLT_WEIGHT_MAX}")  # Debug
+
+                        # Note: Actual randomization only happens during node execution
+                        print(f"Weight range updated: {weight_min} to {weight_max}")  # Debug
+                    except Exception as e:
+                        print(f"Weight range update error: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+                if "Randomize Weights" not in properties:
+                    properties["Randomize Weights"] = bpy.props.BoolProperty(
+                        name="Randomize Weights",
+                        description="Randomly set weights for each text entry within min/max range when this node runs",
+                        get=_get_randomize_weights,
+                        set=_set_randomize_weights,
+                        update=_update_randomize_weights,
+                    )
+
+                if "Weight Min" not in properties:
+                    properties["Weight Min"] = bpy.props.FloatProperty(
+                        name="Weight Min",
+                        description="Minimum weight value for randomization",
+                        default=MLT_WEIGHT_MIN,
+                        min=MLT_WEIGHT_MIN,
+                        max=MLT_WEIGHT_MAX,
+                        step=MLT_WEIGHT_STEP,
+                        precision=MLT_WEIGHT_PRECISION,
+                        get=_get_weight_min,
+                        set=_set_weight_min,
+                        update=_update_weight_range,
+                    )
+
+                if "Weight Max" not in properties:
+                    properties["Weight Max"] = bpy.props.FloatProperty(
+                        name="Weight Max",
+                        description="Maximum weight value for randomization",
+                        default=MLT_WEIGHT_MAX,
+                        min=MLT_WEIGHT_MIN,
+                        max=MLT_WEIGHT_MAX,
+                        step=MLT_WEIGHT_STEP,
+                        precision=MLT_WEIGHT_PRECISION,
+                        get=_get_weight_max,
+                        set=_set_weight_max,
+                        update=_update_weight_range,
+                    )
+
+                if "Enable Max Items" not in properties:
+                    properties["Enable Max Items"] = bpy.props.BoolProperty(
+                        name="Enable Max Items",
+                        description="Enable limiting the number of text items used",
+                        default=False,
+                        get=_get_enable_max_items,
+                        set=_set_enable_max_items,
+                        update=_update_enable_max_items,
+                    )
+
+                if "Max Items Limit" not in properties:
+                    properties["Max Items Limit"] = bpy.props.IntProperty(
+                        name="Max Items Limit",
+                        description="Maximum number of text items to use when enabled",
+                        default=100,
+                        min=1,
+                        max=100,
+                        get=_get_max_items_limit,
+                        set=_set_max_items_limit,
+                    )
+
+
+
+                # UI bridge for per-instance full_range_weights stored in ID properties
+                def _get_full_range_weights(self):
+                    try:
+                        return bool(self.get("full_range_weights", False))
+                    except Exception:
+                        return False
+
+                def _set_full_range_weights(self, value):
+                    try:
+                        self["full_range_weights"] = bool(value)
+                    except Exception:
+                        ...
+
+                def _update_full_range_weights(self, context):
+                    """Update callback for full range weights - sets min/max to full range when enabled"""
+                    try:
+                        full_range_enabled = self.get("full_range_weights", False)
+                        randomize_enabled = self.get("randomize_weights", False)
+                        print(f"Full Range Weights callback triggered: enabled={full_range_enabled}, randomize_enabled={randomize_enabled}")  # Debug
+
+                        if full_range_enabled:
+                            # Check if randomize weights is enabled - if not, disable full range weights
+                            if not randomize_enabled:
+                                self["full_range_weights"] = False
+                                print("Full Range Weights cannot be enabled because Randomize Weights is disabled")  # Debug
+                                return
+
+                            # Full range weights now uses the user's current min/max values
+                            # No need to reset them - the randomization logic will use the current values
+                            current_min = self.get("weight_min", MLT_WEIGHT_MIN)
+                            current_max = self.get("weight_max", MLT_WEIGHT_MAX)
+                            print(f"Full range weights enabled - using current user values: {current_min} to {current_max}")  # Debug
+                        else:
+                            # Full range weights disabled - no action needed since we don't modify user values
+                            print("Full range weights disabled - user values remain unchanged")  # Debug
+                    except Exception as e:
+                        print(f"Full range weights update error: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+                if "Full Range Weights" not in properties:
+                    properties["Full Range Weights"] = bpy.props.BoolProperty(
+                        name="Full Range Weights",
+                        description="Use full weight range (-2 to 2) instead of custom min/max values",
+                        get=_get_full_range_weights,
+                        set=_set_full_range_weights,
+                        update=_update_full_range_weights,
+                    )
+
                 # Update callback: central sync (avoid duplicating logic here)
                 def _make_proxy_update(_i: int):
                     def _update(self, context):
@@ -3048,7 +3434,7 @@ class MLT_REPLACE_WORDS_UL_UIList(bpy.types.UIList):
 
 
 
-clss = [SDNConfig, MLTText, MLTRec, MLTWords_UL_UIList, MLTText_UL_UIList, MoveMLTTextItem, Ops_Switch_Socket_Disp, Ops_Switch_Socket_Widget, Ops_Add_SaveImage, Set_Render_Res, GetSelCol, AdvTextEdit, MLTAddEmpty, SetMLTActiveIndex, InsertWeightKeyframe, DeleteWeightKeyframe, Ops_Active_Tex, Ops_Link_Mask, Images, MLT_REPLACE_WORDS_UL_UIList, SDN_OT_ToggleRandomizeWords]
+clss = [SDNConfig, MLTText, MLTRec, MLTWords_UL_UIList, MLTText_UL_UIList, MoveMLTTextItem, Ops_Switch_Socket_Disp, Ops_Switch_Socket_Widget, Ops_Add_SaveImage, Set_Render_Res, GetSelCol, AdvTextEdit, MLTAddEmpty, SetMLTActiveIndex, InsertWeightKeyframe, DeleteWeightKeyframe, Ops_Active_Tex, Ops_Link_Mask, Images, MLT_REPLACE_WORDS_UL_UIList]
 
 reg, unreg = bpy.utils.register_classes_factory(clss)
 

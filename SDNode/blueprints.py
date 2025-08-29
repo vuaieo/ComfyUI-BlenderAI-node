@@ -1277,8 +1277,11 @@ class 预览(BluePrintBase):
             return True
 
     def serialize_pre_specific(s, self: NodeBase):
-        # Do not clear previews during serialization; keep existing previews even if unlinked
-        return
+        if self.inputs[0].is_linked:
+            return
+        if get_pref().keep_preview_of_prev_node:
+            return
+        self.prev.clear()
 
     def post_fn(s, self: NodeBase, t: Task, result):
         logger.debug("%s%s->%s", self.class_type, _T('Post Function'), result)
@@ -1369,8 +1372,11 @@ class PreviewImage(BluePrintBase):
             return True
 
     def serialize_pre_specific(s, self: NodeBase):
-        # Keep previews even if unlinked; do not clear on serialize
-        return
+        if self.inputs[0].is_linked:
+            return
+        if get_pref().keep_preview_of_prev_node:
+            return
+        self.prev.clear()
 
     def post_fn(s, self: NodeBase, t: Task, result):
         logger.debug("%s%s->%s", self.class_type, _T('Post Function'), result)
@@ -3559,7 +3565,245 @@ class CLIPTextEncode(BluePrintBase):
     def serialize(s, self: NodeBase, execute=True, parent: NodeBase = None):
         print(f"CLIPTextEncode.serialize called - execute={execute}")  # Debug
         
-        # Apply list randomization if enabled - shuffle before serialization  
+        # Apply weight randomization if enabled
+        randomize_weights_enabled = self.get("randomize_weights", False)
+        if randomize_weights_enabled:
+            # Check if node has both input and output connections
+            has_input_connection = any(socket.is_linked for socket in self.inputs)
+            has_output_connection = any(socket.is_linked for socket in self.outputs)
+            is_fully_connected = has_input_connection and has_output_connection
+
+            if is_fully_connected:
+                import random
+                # Use user-specified range for both full range and custom range modes
+                weight_min = self.get("weight_min", -2.0)
+                weight_max = self.get("weight_max", 2.0)
+                range_type = "FULL RANGE EXTREMES" if self.get("full_range_weights", False) else "CUSTOM RANGE"
+                print(f"SERIALIZE: Using {range_type}: {weight_min} to {weight_max}")  # Debug
+                print(f"SERIALIZE: Full range enabled: {self.get('full_range_weights', False)}")  # Debug
+
+                try:
+                    stat = self.mlt_stats.get("text")
+                    if stat and stat.enable and stat.texts:
+                        mode = "FULL RANGE EXTREMES" if self.get("full_range_weights", False) else "CUSTOM RANGE RANDOM"
+                        print(f"Setting weights during execution: {len(stat.texts)} items (mode: {mode})")  # Debug
+
+                        # Get the proxy slot map for this stat
+                        from .nodes import _get_stat_proxy_map, get_proxy_prop_name, compute_slot_key
+                        slot_map = _get_stat_proxy_map(self, stat.name)
+
+                        # Get max items limit to only randomize items that will actually be used
+                        enable_max_items = self.get("enable_max_items", False)
+                        max_items_limit = self.get("max_items_limit", 10) if enable_max_items else len(stat.texts)
+
+                        # Count how many items have randomization enabled (limited by max items)
+                        enabled_count = 0
+                        for idx, text_item in enumerate(stat.texts[:max_items_limit]):  # Only consider items within limit
+                            if getattr(text_item, "enable_randomization", True):
+                                enabled_count += 1
+                        is_single_item = enabled_count == 1
+
+                        # Collect current state for comparison (only for items within max items limit)
+                        current_weights = []
+                        previous_weights = []
+                        enabled_items = []
+
+                        for idx, text_item in enumerate(stat.texts[:max_items_limit]):  # Only consider items within limit
+                            randomization_enabled = getattr(text_item, "enable_randomization", True)
+                            if randomization_enabled:
+                                current_weight = float(text_item.get_weight())
+                                previous_weight = getattr(text_item, "previous_weight", current_weight)
+
+                                current_weights.append(current_weight)
+                                previous_weights.append(previous_weight)
+                                enabled_items.append((idx, text_item, current_weight, previous_weight))
+
+                        # Generate new weights ensuring the overall combination is ALWAYS different from previous
+                        def generate_different_combination():
+                            """Generate a weight combination that's guaranteed to be different from previous"""
+                            if self.get("full_range_weights", False):
+                                if abs(weight_min - weight_max) <= 1e-6:
+                                    # If min == max, all items get the same value, so we need to ensure
+                                    # this combination is different from previous (which should be impossible
+                                    # if all previous weights were also the same value)
+                                    new_weights = [weight_min] * len(enabled_items)
+                                    return new_weights, True  # Always consider this as changed since it's a special case
+
+                                # For full range, we have 2^N possible combinations (N = number of items)
+                                # We'll try random combinations until we find one different from previous
+                                max_attempts = min(100, 2 ** len(enabled_items))  # Cap at reasonable limit
+
+                                for attempt in range(max_attempts):
+                                    new_weights = []
+
+                                    # Ensure at least one item ALWAYS changes
+                                    if len(enabled_items) == 1:
+                                        # For single item: always change
+                                        guaranteed_changer_indices = [0]
+                                    else:
+                                        # For multiple items: randomly select one item to be the guaranteed changer
+                                        guaranteed_changer_index = random.randint(0, len(enabled_items) - 1)
+                                        guaranteed_changer_indices = [guaranteed_changer_index]
+
+                                    for i, (_, _, current_weight, _) in enumerate(enabled_items):
+                                        if i in guaranteed_changer_indices:
+                                            # This item is guaranteed to change
+                                            should_change = True
+                                        else:
+                                            # Other items: 50% chance to change, 50% chance to keep same
+                                            should_change = random.choice([True, False])
+
+                                        if should_change:
+                                            # If changing, randomly choose between min and max (50% each)
+                                            final_weight = weight_max if random.choice([True, False]) else weight_min
+                                            # Ensure it actually changes from current value
+                                            if abs(final_weight - current_weight) <= 1e-6:
+                                                final_weight = weight_min if final_weight == weight_max else weight_max
+                                        else:
+                                            # If not changing, keep the current weight
+                                            final_weight = current_weight
+
+                                        new_weights.append(final_weight)
+
+                                    # Check if this combination is different from previous
+                                    if tuple(new_weights) != tuple(previous_weights):
+                                        return new_weights, True
+
+                                # If we exhausted all attempts, force at least one item to be different
+                                print(f"Warning: Could not find different combination after {max_attempts} attempts, forcing change")  # Debug
+                                new_weights = []
+
+                                # Ensure at least one item ALWAYS changes
+                                if len(enabled_items) == 1:
+                                    # For single item: always change
+                                    guaranteed_changer_indices = [0]
+                                else:
+                                    # For multiple items: force the first item to change as guaranteed changer
+                                    guaranteed_changer_indices = [0]
+
+                                for i, (_, _, current_weight, _) in enumerate(enabled_items):
+                                    if i in guaranteed_changer_indices:
+                                        # This item is guaranteed to change
+                                        should_change = True
+                                    else:
+                                        # Other items: random chance to change
+                                        should_change = random.choice([True, False])
+
+                                    if should_change:
+                                        final_weight = weight_max if random.choice([True, False]) else weight_min
+                                        # Ensure it actually changes from current value
+                                        if abs(final_weight - current_weight) <= 1e-6:
+                                            final_weight = weight_min if final_weight == weight_max else weight_max
+                                    else:
+                                        final_weight = current_weight
+
+                                    new_weights.append(final_weight)
+                                return new_weights, True
+
+                            else:
+                                # For custom range, generate random values ensuring overall difference
+                                max_attempts = 50
+                                for attempt in range(max_attempts):
+                                    new_weights = []
+                                    for _, _, current_weight, prev_weight in enabled_items:
+                                        # Generate random weight within range
+                                        attempts = 20
+                                        for _ in range(attempts):
+                                            final_weight = random.uniform(weight_min, weight_max)
+                                            final_weight = round(final_weight, 2)
+                                            if abs(final_weight - current_weight) > 1e-6 and abs(final_weight - prev_weight) > 1e-6:
+                                                break
+                                        else:
+                                            # If we couldn't find a different value, use a slightly different value
+                                            final_weight = current_weight + 0.01
+                                            if final_weight > weight_max:
+                                                final_weight = weight_max
+                                            elif final_weight < weight_min:
+                                                final_weight = weight_min
+                                            final_weight = round(final_weight, 2)
+
+                                        new_weights.append(final_weight)
+
+                                    # Check if this combination is different from previous
+                                    if tuple(new_weights) != tuple(previous_weights):
+                                        return new_weights, True
+
+                                # Fallback: ensure at least one item is different
+                                print(f"Warning: Could not find different combination after {max_attempts} attempts, forcing change")  # Debug
+                                new_weights = []
+                                for i, (_, _, current_weight, prev_weight) in enumerate(enabled_items):
+                                    if i == 0:  # Force first item to be different
+                                        if abs(weight_min - prev_weight) > 1e-6:
+                                            final_weight = weight_min
+                                        else:
+                                            final_weight = weight_max
+                                        final_weight = round(final_weight, 2)
+                                    else:
+                                        final_weight = random.uniform(weight_min, weight_max)
+                                        final_weight = round(final_weight, 2)
+                                    new_weights.append(final_weight)
+                                return new_weights, True
+
+                        # Generate the guaranteed different combination
+                        new_weights, combination_changed = generate_different_combination()
+
+                        # Apply the new weights
+                        for (idx, text_item, _, _), new_weight in zip(enabled_items, new_weights):
+                            # Set the weight on the text item
+                            text_item.set_weight(new_weight)
+                            # Store current weight as previous for next time
+                            text_item.previous_weight = float(text_item.get_weight())
+
+                            # Update the corresponding proxy property to reflect the new weight
+                            uid = getattr(text_item, "uid", "")
+                            key = compute_slot_key(uid, idx)
+                            slot = slot_map.get(key)
+                            if slot is not None:
+                                pname = get_proxy_prop_name(int(slot))
+                                if hasattr(self, pname):
+                                    try:
+                                        setattr(self, pname, float(new_weight))
+                                        print(f"Updated proxy {pname} to {new_weight}")  # Debug
+                                    except Exception as proxy_error:
+                                        print(f"Failed to update proxy {pname}: {proxy_error}")
+
+                        print(f"Weight randomization completed - guaranteed different combination: {combination_changed}")  # Debug
+
+                        # Handle items with randomization disabled
+                        for idx, text_item in enumerate(stat.texts):
+                            randomization_enabled = getattr(text_item, "enable_randomization", True)
+                            if not randomization_enabled:
+                                final_weight = float(text_item.get_weight())
+                                text_item.previous_weight = final_weight
+                                print(f"Skipped randomization for text item {idx} (randomization disabled)")  # Debug
+
+                                # Set the weight on the text item (no change needed for disabled items)
+                                text_item.set_weight(final_weight)
+
+                                # Update the corresponding proxy property to reflect the new weight
+                                uid = getattr(text_item, "uid", "")
+                                key = compute_slot_key(uid, idx)
+                                slot = slot_map.get(key)
+                                if slot is not None:
+                                    pname = get_proxy_prop_name(int(slot))
+                                    if hasattr(self, pname):
+                                        try:
+                                            setattr(self, pname, float(final_weight))
+                                            print(f"Updated proxy {pname} to {final_weight}")  # Debug
+                                        except Exception as proxy_error:
+                                            print(f"Failed to update proxy {pname}: {proxy_error}")
+
+                        # Write back to node property so diff detects a change
+                        stat.dump_list_to_node_prop(self)
+                        print("Weight randomization completed during execution")  # Debug
+                except Exception as e:
+                    print(f"Weight randomization error: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"Weight randomization skipped: Node not fully connected (input: {has_input_connection}, output: {has_output_connection})")  # Debug
+
+        # Apply list randomization if enabled - shuffle before serialization
         randomize_enabled = self.get("randomize_words", False)
         print(f"Checking randomize_words: {randomize_enabled}")  # Debug
         
@@ -3612,11 +3856,20 @@ class CLIPTextEncode(BluePrintBase):
                         
                         # Only shuffle if we have shuffleable items
                         if len(shuffleable_indices) > 1:
+                            # Check if max items limit is enabled
+                            enable_max_items = self.get("enable_max_items", False)
+                            max_items_limit = self.get("max_items_limit", 10) if enable_max_items else len(stat.texts)
+
+                            # Get previous first N items for comparison (when max items is enabled)
+                            previous_first_n_items = None
+                            if enable_max_items and hasattr(self, '_previous_first_n_items'):
+                                previous_first_n_items = self._previous_first_n_items
+
                             # Generate new shuffle order that's different from previous
                             max_attempts = 100
                             attempts = 0
                             new_order = original_indices.copy()
-                            
+
                             # For 2 shuffleable items, just swap them
                             if len(shuffleable_indices) == 2:
                                 # Swap the two shuffleable positions
@@ -3624,27 +3877,48 @@ class CLIPTextEncode(BluePrintBase):
                                 new_order[idx1], new_order[idx2] = new_order[idx2], new_order[idx1]
                             else:
                                 # For more than 2 shuffleable items, keep trying until different
-                                while new_order == previous_order and attempts < max_attempts:
+                                # Check both full order and first N items (when max items is enabled)
+                                while attempts < max_attempts:
                                     # Use time-based seed to ensure different results
                                     seed = int(time.time() * 1000000) + attempts
                                     random.seed(seed)
                                     new_order = original_indices.copy()
-                                    
+
                                     # Only shuffle the shuffleable positions
                                     shuffleable_values = [new_order[i] for i in shuffleable_indices]
                                     random.shuffle(shuffleable_values)
                                     for i, idx in enumerate(shuffleable_indices):
                                         new_order[idx] = shuffleable_values[i]
-                                    
+
+                                    # Check if this order is different from previous
+                                    is_different = new_order != previous_order
+
+                                    # If max items is enabled, also check if first N items are different
+                                    if enable_max_items and is_different:
+                                        current_first_n = tuple(new_order[:max_items_limit])
+                                        if previous_first_n_items is not None:
+                                            is_different = current_first_n != previous_first_n_items
+                                            print(f"Max items enabled - checking first {max_items_limit} items: {current_first_n} vs {previous_first_n_items}")  # Debug
+
+                                    # Break if we found a different combination
+                                    if is_different:
+                                        break
+
                                     attempts += 1
-                                    
+
                                 # Fallback: if still same after max attempts, swap first two shuffleable
                                 if new_order == previous_order and len(shuffleable_indices) >= 2:
                                     idx1, idx2 = shuffleable_indices[0], shuffleable_indices[1]
                                     new_order[idx1], new_order[idx2] = new_order[idx2], new_order[idx1]
-                            
+
                             # Store the new order for next time
                             self._last_shuffle_order = new_order.copy()
+
+                            # Store the first N items for next comparison (when max items is enabled)
+                            if enable_max_items:
+                                self._previous_first_n_items = tuple(new_order[:max_items_limit])
+                                print(f"Stored first {max_items_limit} items for next comparison: {self._previous_first_n_items}")  # Debug
+
                             indices = new_order
                         else:
                             print("No shuffleable items or only one item to shuffle")  # Debug
@@ -3655,13 +3929,15 @@ class CLIPTextEncode(BluePrintBase):
                         original_items = []
                         for idx, item in enumerate(stat.texts):
                             enable_shuffling_state = getattr(item, 'enable_shuffling', True)
-                            print(f"Backing up item {idx}: '{item.name}' enable_shuffling={enable_shuffling_state}")  # Debug
+                            enable_randomization_state = getattr(item, 'enable_randomization', True)
+                            print(f"Backing up item {idx}: '{item.name}' enable_shuffling={enable_shuffling_state}, enable_randomization={enable_randomization_state}")  # Debug
                             original_items.append({
                                 'name': item.name,
                                 'uid': getattr(item, 'uid', ''),
-                                'enable_shuffling': enable_shuffling_state
+                                'enable_shuffling': enable_shuffling_state,
+                                'enable_randomization': enable_randomization_state
                             })
-                        
+
                         # Clear and rebuild in shuffled order
                         stat.texts.clear()
                         for new_idx, original_idx in enumerate(indices):
@@ -3670,7 +3946,8 @@ class CLIPTextEncode(BluePrintBase):
                             if original_items[original_idx]['uid']:
                                 new_item.uid = original_items[original_idx]['uid']
                             new_item.enable_shuffling = original_items[original_idx]['enable_shuffling']
-                            print(f"Restored item {new_idx}: '{new_item.name}' enable_shuffling={new_item.enable_shuffling}")  # Debug
+                            new_item.enable_randomization = original_items[original_idx]['enable_randomization']
+                            print(f"Restored item {new_idx}: '{new_item.name}' enable_shuffling={new_item.enable_shuffling}, enable_randomization={new_item.enable_randomization}")  # Debug
                         
                         # Update node property to reflect new order
                         stat.dump_list_to_node_prop(self)
@@ -3684,7 +3961,26 @@ class CLIPTextEncode(BluePrintBase):
                     traceback.print_exc()
         else:
             print("Randomization not enabled or property not found")  # Debug
-        
+
+        # Apply max items limit if enabled
+        enable_max_items = self.get("enable_max_items", False)
+        if enable_max_items and execute:  # Only apply during execution, not during property updates
+            max_items_limit = self.get("max_items_limit", 10)
+            try:
+                # Get current text value
+                current_text = self.get("text", "")
+                if current_text:
+                    # Split by comma and limit to max_items_limit
+                    parts = [p.strip() for p in current_text.split(",") if p.strip()]
+                    if len(parts) > max_items_limit:
+                        limited_parts = parts[:max_items_limit]
+                        limited_text = ",".join(limited_parts)
+                        # Update the text property with limited items
+                        self["text"] = limited_text
+                        print(f"CLIPTextEncode: Limited text from {len(parts)} to {len(limited_parts)} items")  # Debug
+            except Exception as e:
+                print(f"Max items limit error: {e}")
+
         # Call parent method
         return super().serialize(self, execute, parent)
 
@@ -3705,31 +4001,77 @@ class CLIPTextEncode(BluePrintBase):
             ...
 
     def draw_button(s, self: NodeBase, context: Context, layout: UILayout, prop: str, swsock=True, swdisp=False):
+        # Handle the randomize weights property specifically to prevent duplicate drawing
+        if prop == "Randomize Weights":
+            # This property is handled in the text UI, so don't draw it again
+            return True
+
+        # Handle the weight min/max properties specifically to prevent duplicate drawing
+        if prop in ["Weight Min", "Weight Max"]:
+            # These properties are handled in the text UI, so don't draw them again
+            return True
+
+        # Handle the full range weights property specifically to prevent duplicate drawing
+        if prop == "Full Range Weights":
+            # This property is handled in the text UI, so don't draw it again
+            return True
+
+        # Handle the enable max items property specifically to prevent duplicate drawing
+        if prop == "Enable Max Items":
+            # This property is handled in the text UI, so don't draw it again
+            return True
+
+        # Handle the max items limit property specifically to prevent duplicate drawing
+        if prop == "Max Items Limit":
+            # This property is handled in the text UI, so don't draw it again
+            return True
+
+        # Handle the randomize text property specifically to hide it when advanced text is disabled
+        if prop == "Randomize Text":
+            # Only show when advanced text UI is enabled
+            stat = self.mlt_stats.get("text")
+            if not bool(stat and stat.enable):
+                return True  # Hide by returning True (don't draw)
+            return False  # Show normally when advanced text is enabled
+
         # Handle the text property specifically
         if prop == "text":
-            # Draw the text property normally first
-            row = draw_prop_with_link(layout, self, prop, swsock, swdisp)
-            
-            # Add the enable mlt button
-            row.operator("sdn.enable_mlt", text="", icon="TEXT")
-            
-            # Add the paste clipboard button
-            op = row.operator("sdn.paste_clipboard_to_mlt", text="", icon="PASTEDOWN")
-            op.socket_name = prop
-            
-            # Add the SwitchAdvText button after the other buttons
+            # Check if max items limit is enabled
+            max_items_enabled = self.get("enable_max_items", False)
+
+            # Create main row for all buttons including SwitchAdvText
+            main_row = layout.row(align=True)
+
+            if max_items_enabled:
+                # When max items is enabled, show a disabled text field with explanation
+                box = main_row.box()
+                box.label(text="Text editing disabled - using list items only", icon="INFO")
+                row = box.row()
+                row.enabled = False
+                row.prop(self, prop, text="Text (Read-only)")
+
+                # Add buttons inside the disabled box
+                row.operator("sdn.enable_mlt", text="", icon="TEXT")
+                op = row.operator("sdn.paste_clipboard_to_mlt", text="", icon="PASTEDOWN")
+                op.socket_name = prop
+            else:
+                # Draw the text property normally when max items is disabled
+                row = draw_prop_with_link(main_row, self, prop, swsock, swdisp)
+
+                # Add buttons to the normal row
+                row.operator("sdn.enable_mlt", text="", icon="TEXT")
+                op = row.operator("sdn.paste_clipboard_to_mlt", text="", icon="PASTEDOWN")
+                op.socket_name = prop
+
+            # Add the SwitchAdvText button to the main row (always enabled, outside the box)
             stat = self.mlt_stats.get(prop)
             enable = bool(stat and stat.enable)
-            op = row.operator("sdn.adv_text_edit", text="", icon="OPTIONS", depress=enable)
+            op = main_row.operator("sdn.adv_text_edit", text="", icon="OPTIONS", depress=enable)
             op.prop = prop
             op.action = "SwitchAdvText"
             
             # Show the multiline text interface if enabled
             if enable:
-                # Add randomize button before the list when advanced text is enabled
-                randomize_row = layout.row(align=True)
-                randomize_enabled = self.get("randomize_words", False)
-                op = randomize_row.operator("sdn.toggle_randomize_words", text="", icon="FORCE_TURBULENCE", depress=randomize_enabled)
                 # If enabled but list not yet built (e.g., after toggle), sync via timer to avoid UI draw context writes
                 try:
                     if stat and not len(stat.texts):
@@ -3777,12 +4119,56 @@ class CLIPTextEncode(BluePrintBase):
                         stat["__owner_node_id"] = self.id
                     except Exception:
                         ...
+                    # Show item count and max items controls above the list
+                    item_count = len(stat.texts) if stat.texts else 0
+                    count_row = layout.row(align=True)
+                    count_row.label(text=f"List Items: {item_count}", icon="TEXT")
+
+                    # Enable Max Items toggle
+                    count_row.prop(self, "Enable Max Items", text="Limit Items", toggle=True)
+
+                    # Show max items limit input only when enabled
+                    if self.get("enable_max_items", False):
+                        count_row.prop(self, "Max Items Limit", text="")
+
                     # Use an integrated UIList that provides reorder/expand/replace controls
                     layout.template_list("MLTText_UL_UIList", "", stat, "texts", stat, "tindex")
                     # Add-Empty button below list
                     add_list_row = layout.row(align=True)
-                    op = add_list_row.operator("sdn.mlt_add_empty", text="", icon="ADD")
-                    op.prop = stat.name
+                    # Disable add button when max items limit is enabled
+                    max_items_enabled = self.get("enable_max_items", False)
+                    add_list_row.enabled = not max_items_enabled
+
+                    if max_items_enabled:
+                        add_list_row.label(text="Adding disabled - limit reached", icon="INFO")
+                    else:
+                        op = add_list_row.operator("sdn.mlt_add_empty", text="", icon="ADD")
+                        op.prop = stat.name
+
+                    # Add randomize weights controls
+                    randomize_weights_row = layout.row(align=True)
+                    randomize_weights_row.prop(self, "Randomize Weights", text="Randomize Weights")
+
+                    # Add full range weights button (disabled if randomize weights is off)
+                    full_range_row = layout.row(align=True)
+                    full_range_enabled = self.get("randomize_weights", False)
+                    full_range_row.enabled = full_range_enabled
+                    full_range_row.prop(self, "Full Range Weights", text="Full Range Weights")
+
+                    # Show min/max controls only when randomize weights is enabled
+                    if self.get("randomize_weights", False):
+                        # Create a box container to control width
+                        box = layout.box()
+                        box.scale_x = 0.25  # Box takes only 25% of layout width
+
+                        # Check if full range is enabled to determine if inputs should be disabled
+                        full_range_enabled = self.get("full_range_weights", False)
+
+                        # Always enable the inputs - users can set their desired range
+                        # When full range is enabled, it will use these values for randomization
+                        box.prop(self, "Weight Min", text="Min")
+                        box.prop(self, "Weight Max", text="Max")
+                        box.enabled = True
             # Always consume drawing for 'text' so the base implementation doesn't add another input
             return True
         
