@@ -827,51 +827,55 @@ class PropGen:
                 stat.freeze = True
                 try:
                     # Rebuild items from edited string with stable UID reuse rules
-                    prev_items = [(t.name, getattr(t, "uid", ""), getattr(t, "enable_shuffling", True), getattr(t, "enable_randomization", True)) for t in stat.texts]
-                    prev_uids_by_index = [u for _, u, _, _ in prev_items]
+                    prev_items = [(t.name, getattr(t, "uid", ""), getattr(t, "enable_generation", True), getattr(t, "enable_shuffling", True), getattr(t, "enable_randomization", True)) for t in stat.texts]
+                    prev_uids_by_index = [u for _, u, _, _, _ in prev_items]
                     stat.texts.clear()
                     new_parts = [p.rstrip() for p in self[inp_name].split(",")]
                     reused_uids: set[str] = set()
                     prev_len = len(prev_items)
                     new_len = len(new_parts)
-                    # Build duplicate-aware mapping name -> [(uid, enable_shuffling, enable_randomization)]
-                    name_to_data: dict[str, list[tuple[str, bool, bool]]] = {}
-                    for pn, pu, pe, pr in prev_items:
+                    # Build duplicate-aware mapping name -> [(uid, enable_generation, enable_shuffling, enable_randomization)]
+                    name_to_data: dict[str, list[tuple[str, bool, bool, bool]]] = {}
+                    for pn, pu, pg, pe, pr in prev_items:
                         if not pu:
                             continue
-                        name_to_data.setdefault(pn, []).append((pu, pe, pr))
+                        name_to_data.setdefault(pn, []).append((pu, pg, pe, pr))
                     for idx, part in enumerate(new_parts):
                         if part == "":
                             continue
                         i = stat.texts.add()
                         reuse_uid = ""
+                        reuse_enable_generation = True  # Default
                         reuse_enable_shuffling = True  # Default
                         reuse_enable_randomization = True  # Default
                         # Prefer name-based reuse. Only fall back to index-based when lengths are equal.
                         if part in name_to_data and name_to_data[part]:
-                            candidate_uid, candidate_enable, candidate_randomization = name_to_data[part][0]
+                            candidate_uid, candidate_enable_gen, candidate_enable, candidate_randomization = name_to_data[part][0]
                             if candidate_uid not in reused_uids:
                                 reuse_uid = candidate_uid
+                                reuse_enable_generation = candidate_enable_gen
                                 reuse_enable_shuffling = candidate_enable
                                 reuse_enable_randomization = candidate_randomization
                                 name_to_data[part].pop(0)
                         elif new_len == prev_len and idx < len(prev_items):
-                            _, candidate_uid, candidate_enable, candidate_randomization = prev_items[idx]
+                            _, candidate_uid, candidate_enable_gen, candidate_enable, candidate_randomization = prev_items[idx]
                             if candidate_uid and candidate_uid not in reused_uids:
                                 reuse_uid = candidate_uid
+                                reuse_enable_generation = candidate_enable_gen
                                 reuse_enable_shuffling = candidate_enable
                                 reuse_enable_randomization = candidate_randomization
                         if reuse_uid:
                             reused_uids.add(reuse_uid)
                         i.uid = reuse_uid or str(uuid4())
                         i.name = part
+                        i.enable_generation = reuse_enable_generation
                         i.enable_shuffling = reuse_enable_shuffling
                         i.enable_randomization = reuse_enable_randomization
                     # Persist mapping for undo/redo
                     _persist_stat_proxy_map(self, inp_name)
                     # Release animations for any previous uid that was not reused (true deletions)
                     try:
-                        prev_uids = [u for _, u, _, _ in prev_items]
+                        prev_uids = [u for _, u, _, _, _ in prev_items]
                         for removed_uid in prev_uids:
                             if removed_uid and removed_uid not in reused_uids:
                                 release_slot_for_uid(self, inp_name, removed_uid)
@@ -963,6 +967,12 @@ class SDNConfig(bpy.types.PropertyGroup):
 
 
 class MLTText(bpy.types.PropertyGroup):
+    enable_generation: bpy.props.BoolProperty(
+        name="Enable Generation",
+        description="Include this text item in image generation",
+        default=True
+    )
+    
     enable_shuffling: bpy.props.BoolProperty(
         name="Enable Shuffling",
         description="Allow this text item to be shuffled during randomization",
@@ -1151,8 +1161,8 @@ class MLTRec(bpy.types.PropertyGroup):
             ...
         
         # Snapshot of previous items (order matters for index-based reuse)
-        prev = [(t.name, getattr(t, "uid", ""), getattr(t, "enable_shuffling", True), getattr(t, "enable_randomization", True)) for t in self.texts]
-        prev_uids_by_index = [u for _, u, _, _ in prev]
+        prev = [(t.name, getattr(t, "uid", ""), getattr(t, "enable_generation", True), getattr(t, "enable_shuffling", True), getattr(t, "enable_randomization", True)) for t in self.texts]
+        prev_uids_by_index = [u for _, u, _, _, _ in prev]
         reused_uids: set[str] = set()
         self.texts.clear()
         
@@ -1168,34 +1178,36 @@ class MLTRec(bpy.types.PropertyGroup):
         new_len = len(parts)
         prev_len = len(prev)
         # Build name->data map to support reuse with duplicates
-        name_to_data: dict[str, list[tuple[str, bool, bool]]] = {}
-        for n, u, e, r in prev:
+        name_to_data: dict[str, list[tuple[str, bool, bool, bool]]] = {}
+        for n, u, g, e, r in prev:
             if not u:
                 continue
-            name_to_data.setdefault(n, []).append((u, e, r))
+            name_to_data.setdefault(n, []).append((u, g, e, r))
         for idx, text in enumerate(parts):
             i = self.texts.add()
             reuse_uid = ""
+            reuse_enable_generation = True  # Default
             reuse_enable_shuffling = True  # Default
             reuse_enable_randomization = True  # Default
             # Strategy:
             # - If lengths differ (insert/delete), avoid index-based reuse to prevent UID sliding
-            #   and only reuse by name.
-            # - If lengths are equal, prefer name-based reuse (handles reorders),
-            #   then fall back to index-based reuse (handles rename-in-place).
+            # - Otherwise, names have first priority, then index-based.
+            # Prefer name-based reuse: exact name matches to avoid UID/animation sliding
             if text in name_to_data and name_to_data[text]:
-                candidate_uid, candidate_enable, candidate_randomization = name_to_data[text][0]
+                candidate_uid, candidate_enable_gen, candidate_enable, candidate_randomization = name_to_data[text][0]
                 if candidate_uid not in reused_uids:
                     reuse_uid = candidate_uid
+                    reuse_enable_generation = candidate_enable_gen
                     reuse_enable_shuffling = candidate_enable
                     reuse_enable_randomization = candidate_randomization
                     # consume one occurrence
                     name_to_data[text].pop(0)
-            elif new_len == prev_len:
-                if idx < len(prev):
-                    _, candidate_uid, candidate_enable, candidate_randomization = prev[idx]
+            elif len(parts) == len(prev) and idx < len(prev):
+                # Index-based fallback for same-length edits
+                    _, candidate_uid, candidate_enable_gen, candidate_enable, candidate_randomization = prev[idx]
                     if candidate_uid and candidate_uid not in reused_uids:
                         reuse_uid = candidate_uid
+                        reuse_enable_generation = candidate_enable_gen
                         reuse_enable_shuffling = candidate_enable
                         reuse_enable_randomization = candidate_randomization
             if reuse_uid:
@@ -1203,12 +1215,13 @@ class MLTRec(bpy.types.PropertyGroup):
             i.uid = reuse_uid or str(uuid4())
             # Keep empty strings as valid items so UI can show empty rows
             i.name = text
+            i.enable_generation = reuse_enable_generation
             i.enable_shuffling = reuse_enable_shuffling
             i.enable_randomization = reuse_enable_randomization
             # No separate weight property; text stores weight
         # Release animations for any previous uid that was not reused (true deletions)
         try:
-            prev_uids = [u for _, u, _, _ in prev]
+            prev_uids = [u for _, u, _, _, _ in prev]
             # Build set of current uids (reused) to protect
             protected = set(reused_uids)
             # Also protect any uid that still appears in the rebuilt items
@@ -1320,6 +1333,11 @@ class MLTText_UL_UIList(bpy.types.UIList):
         is_greyed_out = enable_max_items and index >= max_items_limit
 
         row = layout.row(align=True)
+
+        # Enable generation checkbox (leftmost position)
+        gen_row = row.row(align=True)
+        gen_row.enabled = not is_greyed_out
+        gen_row.prop(item, "enable_generation", text="", icon="CHECKMARK")
 
         # Enable shuffling toggle button (left of up/down arrows) - only show when randomize_words is enabled
         node = get_ctx_node()

@@ -3563,7 +3563,6 @@ class CLIPTextEncode(BluePrintBase):
     comfyClass = "CLIPTextEncode"
 
     def serialize(s, self: NodeBase, execute=True, parent: NodeBase = None):
-        print(f"CLIPTextEncode.serialize called - execute={execute}")  # Debug
         
         # Apply weight randomization if enabled
         randomize_weights_enabled = self.get("randomize_weights", False)
@@ -3579,14 +3578,11 @@ class CLIPTextEncode(BluePrintBase):
                 weight_min = self.get("weight_min", -2.0)
                 weight_max = self.get("weight_max", 2.0)
                 range_type = "FULL RANGE EXTREMES" if self.get("full_range_weights", False) else "CUSTOM RANGE"
-                print(f"SERIALIZE: Using {range_type}: {weight_min} to {weight_max}")  # Debug
-                print(f"SERIALIZE: Full range enabled: {self.get('full_range_weights', False)}")  # Debug
 
                 try:
                     stat = self.mlt_stats.get("text")
                     if stat and stat.enable and stat.texts:
                         mode = "FULL RANGE EXTREMES" if self.get("full_range_weights", False) else "CUSTOM RANGE RANDOM"
-                        print(f"Setting weights during execution: {len(stat.texts)} items (mode: {mode})")  # Debug
 
                         # Get the proxy slot map for this stat
                         from .nodes import _get_stat_proxy_map, get_proxy_prop_name, compute_slot_key
@@ -3767,7 +3763,6 @@ class CLIPTextEncode(BluePrintBase):
                                     except Exception as proxy_error:
                                         print(f"Failed to update proxy {pname}: {proxy_error}")
 
-                        print(f"Weight randomization completed - guaranteed different combination: {combination_changed}")  # Debug
 
                         # Handle items with randomization disabled
                         for idx, text_item in enumerate(stat.texts):
@@ -3795,7 +3790,6 @@ class CLIPTextEncode(BluePrintBase):
 
                         # Write back to node property so diff detects a change
                         stat.dump_list_to_node_prop(self)
-                        print("Weight randomization completed during execution")  # Debug
                 except Exception as e:
                     print(f"Weight randomization error: {e}")
                     import traceback
@@ -3805,7 +3799,6 @@ class CLIPTextEncode(BluePrintBase):
 
         # Apply list randomization if enabled - shuffle before serialization
         randomize_enabled = self.get("randomize_words", False)
-        print(f"Checking randomize_words: {randomize_enabled}")  # Debug
         
         if randomize_enabled:
             # Check if node has both input AND output connections
@@ -3825,22 +3818,19 @@ class CLIPTextEncode(BluePrintBase):
             is_fully_connected = has_input_connection and has_output_connection
             
             if not is_fully_connected:
-                print(f"Node not fully connected (input: {has_input_connection}, output: {has_output_connection}), skipping randomization")  # Debug
+                pass
             else:
                 import random
                 import time
-                print("Randomization is enabled and node is connected, attempting to shuffle...")  # Debug
                 try:
                     stat = self.mlt_stats.get("text")
-                    if stat and stat.texts and len(stat.texts) > 1:
+                    if stat and stat.enable and stat.texts and len(stat.texts) > 1:
                         # Create list of indices
                         indices = list(range(len(stat.texts)))
                         original_indices = indices.copy()
-                        print(f"Original indices: {original_indices}")  # Debug
                         
                         # Get previous shuffle order (stored as node attribute)
                         previous_order = getattr(self, '_last_shuffle_order', original_indices)
-                        print(f"Previous order: {previous_order}")  # Debug
                         
                         # Get shuffleable indices (only items with enable_shuffling=True)
                         shuffleable_indices = []
@@ -3851,8 +3841,6 @@ class CLIPTextEncode(BluePrintBase):
                             else:
                                 fixed_indices.append(i)
                         
-                        print(f"Shuffleable indices: {shuffleable_indices}")  # Debug
-                        print(f"Fixed indices: {fixed_indices}")  # Debug
                         
                         # Only shuffle if we have shuffleable items
                         if len(shuffleable_indices) > 1:
@@ -3860,80 +3848,141 @@ class CLIPTextEncode(BluePrintBase):
                             enable_max_items = self.get("enable_max_items", False)
                             max_items_limit = self.get("max_items_limit", 10) if enable_max_items else len(stat.texts)
 
-                            # Get previous first N items for comparison (when max items is enabled)
-                            previous_first_n_items = None
-                            if enable_max_items and hasattr(self, '_previous_first_n_items'):
-                                previous_first_n_items = self._previous_first_n_items
+                            # Get previous first N item names for comparison (when max items is enabled)
+                            previous_first_n_item_names = None
+                            if enable_max_items and hasattr(self, '_previous_first_n_item_names'):
+                                previous_first_n_item_names = self._previous_first_n_item_names
 
-                            # Generate new shuffle order that's different from previous
-                            max_attempts = 100
-                            attempts = 0
-                            new_order = original_indices.copy()
-
-                            # For 2 shuffleable items, just swap them
-                            if len(shuffleable_indices) == 2:
-                                # Swap the two shuffleable positions
-                                idx1, idx2 = shuffleable_indices
-                                new_order[idx1], new_order[idx2] = new_order[idx2], new_order[idx1]
+                            # Special handling for max_items_limit = 1
+                            if enable_max_items and max_items_limit == 1 and previous_first_n_item_names is not None:
+                                print(f"Special case for max_items_limit=1: previous first item was {previous_first_n_item_names[0]}")
+                                # For limit = 1, we just need to ensure position 0 gets a different item
+                                new_order = original_indices.copy()
+                                previous_first_item_name = previous_first_n_item_names[0]
+                                
+                                # Find any shuffleable item that's different from the previous first item
+                                for candidate_idx in shuffleable_indices:
+                                    candidate_value = new_order[candidate_idx]
+                                    candidate_item_name = stat.texts[candidate_value].name
+                                    
+                                    if candidate_item_name != previous_first_item_name:
+                                        # Put this candidate in position 0
+                                        new_order[0], new_order[candidate_idx] = new_order[candidate_idx], new_order[0]
+                                        print(f"Special case swap: position 0 gets '{candidate_item_name}' instead of '{previous_first_item_name}'")
+                                        break
+                                
+                                attempts = 0  # No attempts needed for special case
                             else:
-                                # For more than 2 shuffleable items, keep trying until different
-                                # Check both full order and first N items (when max items is enabled)
+                                # General approach: Always generate a guaranteed different result
+                                max_attempts = 100
+                                attempts = 0
+                                new_order = None
+
                                 while attempts < max_attempts:
                                     # Use time-based seed to ensure different results
                                     seed = int(time.time() * 1000000) + attempts
                                     random.seed(seed)
-                                    new_order = original_indices.copy()
+                                    test_order = original_indices.copy()
 
                                     # Only shuffle the shuffleable positions
-                                    shuffleable_values = [new_order[i] for i in shuffleable_indices]
+                                    shuffleable_values = [test_order[i] for i in shuffleable_indices]
                                     random.shuffle(shuffleable_values)
                                     for i, idx in enumerate(shuffleable_indices):
-                                        new_order[idx] = shuffleable_values[i]
+                                        test_order[idx] = shuffleable_values[i]
 
-                                    # Check if this order is different from previous
-                                    is_different = new_order != previous_order
+                                    # Check if this order produces different results
+                                    is_valid = True
+                                    
+                                    # PRIORITY CHECK: For max_items_limit = 1, position 0 must change
+                                    if enable_max_items and max_items_limit == 1 and len(shuffleable_indices) > 1:
+                                        if test_order[0] == previous_order[0]:
+                                            is_valid = False
+                                            current_first_item = stat.texts[test_order[0]].name
+                                            print(f"Rejected: max_items_limit=1 but first position unchanged (index {test_order[0]}, item '{current_first_item}')")  # Debug
+                                    
+                                    # Always check against previous order
+                                    if is_valid and test_order == previous_order:
+                                        is_valid = False
 
-                                    # If max items is enabled, also check if first N items are different
-                                    if enable_max_items and is_different:
-                                        current_first_n = tuple(new_order[:max_items_limit])
-                                        if previous_first_n_items is not None:
-                                            is_different = current_first_n != previous_first_n_items
-                                            print(f"Max items enabled - checking first {max_items_limit} items: {current_first_n} vs {previous_first_n_items}")  # Debug
+                                    # If max items is enabled, also check first N item names
+                                    if is_valid and enable_max_items and previous_first_n_item_names is not None:
+                                        current_first_n_names = tuple(stat.texts[test_order[i]].name for i in range(min(max_items_limit, len(test_order))))
+                                        if current_first_n_names == previous_first_n_item_names:
+                                            is_valid = False
+                                            print(f"Rejected: first {max_items_limit} item names same as previous: {current_first_n_names}")  # Debug
 
-                                    # Break if we found a different combination
-                                    if is_different:
+                                    if is_valid:
+                                        new_order = test_order
                                         break
 
                                     attempts += 1
 
-                                # Fallback: if still same after max attempts, swap first two shuffleable
-                                if new_order == previous_order and len(shuffleable_indices) >= 2:
-                                    idx1, idx2 = shuffleable_indices[0], shuffleable_indices[1]
-                                    new_order[idx1], new_order[idx2] = new_order[idx2], new_order[idx1]
+                            # If we couldn't find a valid shuffle, force one
+                            if new_order is None:
+                                print(f"Forcing fallback shuffle after {max_attempts} attempts")  # Debug
+                                new_order = original_indices.copy()
+                                
+                                if enable_max_items:
+                                    # Special aggressive handling for max_items_limit = 1
+                                    if max_items_limit == 1:
+                                        # For limit = 1, just put any different shuffleable item in position 0
+                                        current_first_item_name = stat.texts[new_order[0]].name
+                                        for candidate_idx in shuffleable_indices:
+                                            if candidate_idx == 0:  # Skip position 0 itself
+                                                continue
+                                            candidate_value = new_order[candidate_idx]
+                                            candidate_item_name = stat.texts[candidate_value].name
+                                            if candidate_item_name != current_first_item_name:
+                                                # Swap position 0 with this candidate
+                                                new_order[0], new_order[candidate_idx] = new_order[candidate_idx], new_order[0]
+                                                print(f"Aggressive fallback for max_items_limit=1: position 0 '{current_first_item_name}' -> '{candidate_item_name}'")
+                                                break
+                                    else:
+                                        # Force different first N items by strategic swapping
+                                        for target_pos in range(min(max_items_limit, len(shuffleable_indices))):
+                                            if target_pos >= len(new_order):
+                                                break
+                                            
+                                            current_item_name = stat.texts[new_order[target_pos]].name
+                                            
+                                            # Find a different shuffleable item to put in this position
+                                            for candidate_idx in shuffleable_indices:
+                                                candidate_value = new_order[candidate_idx]
+                                                candidate_item_name = stat.texts[candidate_value].name
+                                                
+                                                if candidate_item_name != current_item_name:
+                                                    # Swap this position with the candidate
+                                                    new_order[target_pos], new_order[candidate_idx] = new_order[candidate_idx], new_order[target_pos]
+                                                    print(f"Forced swap: position {target_pos} '{current_item_name}' -> '{candidate_item_name}'")
+                                                    break
+                                else:
+                                    # No max items limit, just swap first two shuffleable
+                                    if len(shuffleable_indices) >= 2:
+                                        idx1, idx2 = shuffleable_indices[0], shuffleable_indices[1]
+                                        new_order[idx1], new_order[idx2] = new_order[idx2], new_order[idx1]
 
                             # Store the new order for next time
                             self._last_shuffle_order = new_order.copy()
 
-                            # Store the first N items for next comparison (when max items is enabled)
+                            # Store the first N item names for next comparison (when max items is enabled)
                             if enable_max_items:
-                                self._previous_first_n_items = tuple(new_order[:max_items_limit])
-                                print(f"Stored first {max_items_limit} items for next comparison: {self._previous_first_n_items}")  # Debug
+                                first_n_item_names = tuple(stat.texts[new_order[i]].name for i in range(min(max_items_limit, len(new_order))))
+                                self._previous_first_n_item_names = first_n_item_names
 
                             indices = new_order
                         else:
-                            print("No shuffleable items or only one item to shuffle")  # Debug
                             indices = original_indices
-                        print(f"New shuffled indices: {indices} (attempts: {attempts})")  # Debug
                         
                         # Simple approach: Create new list in shuffled order
                         original_items = []
                         for idx, item in enumerate(stat.texts):
+                            enable_generation_state = getattr(item, 'enable_generation', True)
                             enable_shuffling_state = getattr(item, 'enable_shuffling', True)
                             enable_randomization_state = getattr(item, 'enable_randomization', True)
-                            print(f"Backing up item {idx}: '{item.name}' enable_shuffling={enable_shuffling_state}, enable_randomization={enable_randomization_state}")  # Debug
                             original_items.append({
                                 'name': item.name,
                                 'uid': getattr(item, 'uid', ''),
+                                'enable_generation': enable_generation_state,
                                 'enable_shuffling': enable_shuffling_state,
                                 'enable_randomization': enable_randomization_state
                             })
@@ -3945,50 +3994,78 @@ class CLIPTextEncode(BluePrintBase):
                             new_item.name = original_items[original_idx]['name']
                             if original_items[original_idx]['uid']:
                                 new_item.uid = original_items[original_idx]['uid']
+                            new_item.enable_generation = original_items[original_idx]['enable_generation']
                             new_item.enable_shuffling = original_items[original_idx]['enable_shuffling']
                             new_item.enable_randomization = original_items[original_idx]['enable_randomization']
-                            print(f"Restored item {new_idx}: '{new_item.name}' enable_shuffling={new_item.enable_shuffling}, enable_randomization={new_item.enable_randomization}")  # Debug
                         
                         # Update node property to reflect new order
                         stat.dump_list_to_node_prop(self)
-                        print("List order randomized successfully")  # Debug
-                    else:
-                        print("No stat or insufficient text items for randomization")  # Debug
-                        
                 except Exception as e:
                     print(f"Randomization error: {e}")
                     import traceback
                     traceback.print_exc()
-        else:
-            print("Randomization not enabled or property not found")  # Debug
 
-        # Apply max items limit if enabled
+        # Apply filtering for disabled items and max items limit if enabled
         enable_max_items = self.get("enable_max_items", False)
-        if enable_max_items and execute:  # Only apply during execution, not during property updates
-            max_items_limit = self.get("max_items_limit", 10)
+        limited_text_for_execution = None
+        if execute:  # Only apply during execution, not during property updates
             try:
-                # Get current text value
-                current_text = self.get("text", "")
-                if current_text:
-                    # Split by comma and limit to max_items_limit
-                    parts = [p.strip() for p in current_text.split(",") if p.strip()]
-                    if len(parts) > max_items_limit:
-                        limited_parts = parts[:max_items_limit]
-                        limited_text = ",".join(limited_parts)
-                        # Update the text property with limited items
-                        self["text"] = limited_text
-                        print(f"CLIPTextEncode: Limited text from {len(parts)} to {len(limited_parts)} items")  # Debug
+                current_text = getattr(self, "text", "")
+                if current_text and current_text.strip():
+                    # Get the stat to check enable_generation flags
+                    stat = self.mlt_stats.get("text")
+                    if stat and stat.enable and stat.texts:
+                        # Filter out items where enable_generation is False
+                        enabled_parts = []
+                        for item in stat.texts:
+                            if getattr(item, "enable_generation", True) and item.name.strip():
+                                enabled_parts.append(item.name.strip())
+                        
+                        # Apply max items limit if enabled
+                        if enable_max_items:
+                            max_items_limit = self.get("max_items_limit", 10)
+                            if len(enabled_parts) > max_items_limit:
+                                enabled_parts = enabled_parts[:max_items_limit]
+                        
+                        if enabled_parts:
+                            limited_text_for_execution = ",".join(enabled_parts)
+                        else:
+                            limited_text_for_execution = ""  # No enabled items
+                    else:
+                        # Fallback to original logic if no stat available
+                        parts = [p.strip() for p in current_text.split(",") if p.strip()]
+                        if enable_max_items:
+                            max_items_limit = self.get("max_items_limit", 10)
+                            if len(parts) > max_items_limit:
+                                limited_parts = parts[:max_items_limit]
+                                limited_text_for_execution = ",".join(limited_parts)
             except Exception as e:
-                print(f"Max items limit error: {e}")
+                print(f"Text filtering error: {e}")
 
         # Call parent method
-        return super().serialize(self, execute, parent)
+        result = super().serialize(self, execute, parent)
+
+        # If we used limited text, override the text input in the result
+        if limited_text_for_execution is not None and "inputs" in result:
+            result["inputs"]["text"] = limited_text_for_execution
+
+        return result
 
     def serialize_pre_specific(s, self: NodeBase):
         # Ensure current-frame proxy values are baked into the text before execution
+        # Only do this if SwitchAdvText is currently enabled
         try:
             stat = self.mlt_stats.get("text")
-            if not stat or not stat.texts:
+            if not stat or not stat.enable or not stat.texts:
+                # If SwitchAdvText is disabled but stat exists, ensure it doesn't interfere with normal text editing
+                if stat and not stat.enable:
+                    # Clear any lingering state that might cause issues
+                    try:
+                        # Don't modify the text property if SwitchAdvText is disabled
+                        # This prevents the stat from overwriting user edits
+                        pass
+                    except Exception:
+                        pass
                 return
             from .nodes import bootstrap_slot_map_from_fcurves, sync_proxies_to_text
             # Make sure slot map exists on freshly loaded files
