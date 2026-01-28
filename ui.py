@@ -10,7 +10,7 @@ from .SDNode import TaskManager, FakeServer
 from .SDNode.tree import TREE_TYPE
 from .SDNode.nodes import NodeBase
 from .SDNode.rt_tracker import Tracker_Loop, is_looped
-from .SDNode.operators import AIMatSolutionLoad, AIMatSolutionRun, AIMatSolutionSave, AIMatSolutionDel, AIMatSolutionApply, AIMatSolutionRestore
+from .SDNode.operators import AIMatSolutionLoad, AIMatSolutionRun, AIMatSolutionSave, AIMatSolutionDel, AIMatSolutionApply, AIMatSolutionRestore, SDN_OT_SyncGroups
 from .utils import Icon
 from .preference import get_pref, AddonPreference
 from .utils import get_addon_name, _T, get_ai_mat_tree
@@ -142,6 +142,7 @@ class Panel(bpy.types.Panel):
         box = layout.box()
         row = box.row()
         row.label(text="Node Group", text_ctxt=ctxt)
+        row.operator(SDN_OT_SyncGroups.bl_idname, text="", icon="FILE_REFRESH")
         row.prop(bpy.context.scene.sdn, "open_groups_dir", text="", icon="FILEBROWSER", text_ctxt=ctxt)
         col = box.column(align=True)
         col.prop(bpy.context.scene.sdn, "groups_dir", text="", text_ctxt=ctxt)
@@ -290,10 +291,25 @@ class Panel(bpy.types.Panel):
 
 def draw_header_button(self: bpy.types.Menu, context):
     if context.space_data.tree_type == TREE_TYPE:
+        tree = context.space_data.edit_tree
+        if not tree:
+            return
+        
         layout = self.layout
+        
+        # Count selected nodes for multi-select support
+        selected = [n for n in tree.nodes if n.select and n.bl_idname not in {'SDN_ToolbarNode', 'SDN_GroupToolbarNode', 'NodeFrame', 'NodeReroute'}]
+        multi_select = len(selected) > 1
+        
         row = layout.row(align=True)
         row.alert = True
         row.operator(Ops.bl_idname, text="", text_ctxt=ctxt, icon="PLAY").action = "Submit"
+        
+        # MULTI-SELECT CONTROLS (only show when multiple selected)
+        if multi_select:
+            row.operator("sdn.selected_mute_toggle", text="", icon="CHECKBOX_HLT")
+            row.operator("sdn.selected_delete", text="", icon="X")
+        
         row.operator(CleanVRam.bl_idname, text="", icon="MEMORY")
 
 

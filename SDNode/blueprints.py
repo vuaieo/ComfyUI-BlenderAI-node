@@ -519,6 +519,14 @@ class BluePrintBase:
         }
         if self.label:
             cfg["properties"]["label"] = self.label
+        
+        # Defensive recovery of missing_type from label if the property is empty or was never set
+        mtype = getattr(self, "missing_type", "")
+        if not mtype and self.label.startswith("MISSING: "):
+            mtype = self.label.replace("MISSING: ", "")
+        
+        if mtype:
+            cfg["properties"]["missing_type"] = mtype
         if self.use_custom_color:
             color = rgb2hex(*self.color)
             cfg["bgcolor"] = color

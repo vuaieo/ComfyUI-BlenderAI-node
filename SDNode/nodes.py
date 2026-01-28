@@ -260,6 +260,9 @@ class PropGen:
                         items.append((si, spec_trans.get(si, si), ""))
                         continue
                     items.append((si, spec_trans.get(si, si), "", icon_id, len(items)))
+                
+                if not items:
+                    items.append(("NONE", "None", "No options available (Check Server Status)"))
                 return items
 
             return wrap
@@ -299,6 +302,9 @@ class PropGen:
                         items.append((si, spec_trans.get(si, si), ""))
                         continue
                     items.append((si, spec_trans.get(si, si), "", icon_id, len(items)))
+                
+                if not items:
+                    items.append(("NONE", "None", "No options available (Check Server Status)"))
                 return items
 
             return wrap
@@ -1006,14 +1012,45 @@ class NodeBase(bpy.types.Node):
         if not socket.links:
             return
         link = socket.links[0]
+        visited = {self.name}
         while True:
             node = link.from_node
+            if node.name in visited: # Prevent infinite loops
+                return None
+            visited.add(node.name)
+
             if node.bl_idname == "NodeReroute":
                 inp = node.inputs[0]
                 if inp.is_linked and inp.links:
                     link = inp.links[0]
                 else:
                     return
+            elif node.mute:
+                # Bypass logic
+                source_sock = link.from_socket
+                matching_inp = None
+                # Try to find a linked input that matches the output type or name
+                # Priority 1: Same name and linked
+                target_inp = node.inputs.get(source_sock.name)
+                if target_inp and target_inp.is_linked:
+                    matching_inp = target_inp
+                # Priority 2: Same type and linked
+                if not matching_inp:
+                    for inp in node.inputs:
+                        if inp.is_linked and inp.bl_idname == source_sock.bl_idname:
+                            matching_inp = inp
+                            break
+                # Priority 3: Any linked input
+                if not matching_inp:
+                    for inp in node.inputs:
+                        if inp.is_linked:
+                            matching_inp = inp
+                            break
+                
+                if matching_inp:
+                    link = matching_inp.links[0]
+                else:
+                    return None # Cannot bypass
             else:
                 return link
 
@@ -2125,7 +2162,57 @@ class Images(bpy.types.PropertyGroup):
     image: bpy.props.PointerProperty(type=bpy.types.Image)
 
 
-clss = [SDNConfig, MLTText, MLTRec, MLT_WORDS_UL_UIList, MLT_TEXT_UL_UIList, Ops_Switch_Socket_Disp, Ops_Switch_Socket_Widget, Ops_Add_SaveImage, Set_Render_Res, GetSelCol, AdvTextEdit, Ops_Active_Tex, Ops_Link_Mask, Images]
+class SDN_MissingSocket(SocketBase):
+    bl_idname = "SDN_MissingSocket"
+    bl_label = "Missing Socket"
+    slot_index: bpy.props.IntProperty(default=-1)
+
+    def draw(self, context, layout, node, text):
+        layout.label(text=text)
+
+class SDN_MissingNode(NodeBase):
+    bl_idname = "SDN_MissingNode"
+    bl_label = "Missing Node"
+
+    missing_type: bpy.props.StringProperty(name="Original Type")
+    class_type = "SDN_MissingNode"
+    inp_types = []
+    __metadata__ = {}
+
+    def init(self, context):
+        self.use_custom_color = True
+        self.color = (0.8, 0.1, 0.1)
+        self.width = 240
+
+    def load(self, data, with_id=True):
+        # Minimal load to prevent crashes from BluePrintBase
+        pos = data.get("pos", (0, 0))
+        self.location[:] = [pos[0], -pos[1]]
+        if "id" in data:
+            self.id = str(data["id"])
+        if "title" in data:
+            self.label = data["title"]
+        
+        props = data.get("properties", {})
+        if "missing_type" in props:
+            self.missing_type = props["missing_type"]
+        elif self.label.startswith("MISSING: "):
+            self.missing_type = self.label.replace("MISSING: ", "")
+
+    def draw_buttons(self, context, layout):
+        layout.alert = True
+        layout.box().label(text=f"MISSING: {self.missing_type}", icon='ERROR')
+        col = layout.column()
+        col.label(text="This node type is not installed")
+        col.label(text="in your ComfyUI server.")
+        col.separator()
+        op = col.operator("sdn.manager_action", text="Install via Manager", icon='ASSET_MANAGER')
+        op.action = "FETCH_NODES"
+
+    def is_registered_node_type(self):
+        return False
+
+clss = [SDNConfig, MLTText, MLTRec, MLT_WORDS_UL_UIList, MLT_TEXT_UL_UIList, Ops_Switch_Socket_Disp, Ops_Switch_Socket_Widget, Ops_Add_SaveImage, Set_Render_Res, GetSelCol, AdvTextEdit, Ops_Active_Tex, Ops_Link_Mask, Images, SDN_MissingNode, SDN_MissingSocket]
 
 reg, unreg = bpy.utils.register_classes_factory(clss)
 
