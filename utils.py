@@ -582,7 +582,7 @@ class PkgInstaller:
         import importlib
         try:
             return importlib.import_module(package)
-        except ModuleNotFoundError:
+        except (ImportError, Exception):
             return False
 
     @staticmethod

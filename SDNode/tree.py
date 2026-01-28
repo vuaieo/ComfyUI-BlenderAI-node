@@ -9,7 +9,7 @@ import traceback
 import inspect
 import types
 from hashlib import md5
-from mathutils import Color
+from mathutils import Color, Vector
 from string import ascii_letters, digits
 from bpy.app.translations import pgettext
 from threading import Thread
@@ -286,6 +286,9 @@ class CFNodeTree(NodeTree):
         if nodes is None:
             nodes = self.nodes
         for n in nodes:
+            # Skip internal helper nodes like the Toolbar
+            if n.bl_idname == "SDN_ToolbarNode":
+                continue
             if not n.is_registered_node_type():
                 raise InvalidNodeType(_T("Invalid Node Type: {}").format(n.name))
 
@@ -435,11 +438,13 @@ class CFNodeTree(NodeTree):
             to_node = link.to_node
             to_socket = link.to_socket
             if not from_socket.node.is_registered_node_type():
-                logger.error(_T("Invalid Node Type: {}").format(from_socket.node.name))
-                raise InvalidNodeType(_T("Invalid Node Type: {}").format(from_socket.node.name))
+                # Skip links from missing nodes instead of raising error
+                logger.warning(_T("Skipping link from unregistered node: {}").format(from_socket.node.name))
+                continue
             if not to_socket.node.is_registered_node_type():
-                logger.error(_T("Invalid Node Type: {}").format(to_socket.node.name))
-                raise InvalidNodeType(_T("Invalid Node Type: {}").format(to_socket.node.name))
+                # Skip links to missing nodes instead of raising error
+                logger.warning(_T("Skipping link to unregistered node: {}").format(to_socket.node.name))
+                continue
             link_info = [
                 i,
                 int(from_socket.node.id),
@@ -542,8 +547,19 @@ class CFNodeTree(NodeTree):
                     node: NodeBase = self.nodes.new(type=t)
                 except RuntimeError as e:
                     from .manager import TaskManager
-                    TaskManager.put_error_msg(str(e))
-                    continue
+                    TaskManager.put_error_msg(f"Missing custom node: {t}")
+                    node = self.nodes.new(type="SDN_MissingNode")
+                    node.missing_type = t
+                    node.label = f"MISSING: {t}"
+                    # Create placeholder sockets so links can still be established visually
+                    for idx, inp in enumerate(node_info.get("inputs", [])):
+                        s = node.inputs.new("SDN_MissingSocket", inp.get("name", f"In_{idx}"))
+                        s.slot_index = inp.get("slot_index", idx)
+                        s.color = (0.5, 0.5, 0.5, 1.0)
+                    for idx, out in enumerate(node_info.get("outputs", [])):
+                        s = node.outputs.new("SDN_MissingSocket", out.get("name", f"Out_{idx}"))
+                        s.slot_index = out.get("slot_index", idx)
+                        s.color = (0.5, 0.5, 0.5, 1.0)
             if is_group:
                 node.load(node_info, with_id=False)
             else:
@@ -649,7 +665,7 @@ class CFNodeTree(NodeTree):
 
     def get_nodes(self, cmf=True) -> list[NodeBase]:
         if cmf:
-            return [n for n in self.nodes if n.bl_idname not in {"NodeFrame", "NodeGroupInput", "NodeGroupOutput"} and n.is_registered_node_type()]
+            return [n for n in self.nodes if n.bl_idname not in {"NodeFrame", "NodeGroupInput", "NodeGroupOutput", "SDN_ToolbarNode"} and n.is_registered_node_type()]
         return [n for n in self.nodes if n.is_registered_node_type()]
 
     def clear_nodes(self):
@@ -697,16 +713,100 @@ class CFNodeTree(NodeTree):
         """
         force update
         """
-        self.id_clear_update()
-        self.compute_execution_order()
-        self.calc_unique_id()
-        for node in self.nodes:
-            if not node.is_registered_node_type():
-                continue
-            self.primitive_node_update(node)
-            self.dirty_nodes_update(node)
-            self.group_nodes_update(node)
-            self.set_width_update(node)
+        import time
+        # Heavy updates only once per second or if specifically triggered
+        last_heavy = getattr(self, "_last_heavy_update", 0)
+        current_time = time.time()
+        
+        if current_time - last_heavy > 1.0:
+            self.id_clear_update()
+            self.compute_execution_order()
+            self.calc_unique_id()
+            for node in self.nodes:
+                if not node.is_registered_node_type():
+                    continue
+                self.primitive_node_update(node)
+                self.dirty_nodes_update(node)
+                self.group_nodes_update(node)
+                self.set_width_update(node)
+            self._last_heavy_update = current_time
+            
+        # Light update (Toolbar) runs every tick for smoothness
+        return self.toolbar_update()
+
+    def toolbar_update(self):
+        if bpy.app.background:
+            return
+            
+        # 1. FIND TOOLBAR (With Cache)
+        toolbar_name = getattr(self, "_toolbar_name", "")
+        toolbar = self.nodes.get(toolbar_name)
+        if not toolbar or toolbar.bl_idname != 'SDN_ToolbarNode':
+            toolbar = None
+            for node in self.nodes:
+                if node.bl_idname == 'SDN_ToolbarNode':
+                    toolbar = node
+                    self._toolbar_name = node.name
+                    break
+                    
+        active = self.nodes.active
+        
+        # 2. VALIDATE ACTIVE (Must be selected and not a special node)
+        is_valid = active and active.select and active.bl_idname not in {'SDN_ToolbarNode', 'NodeFrame', 'NodeReroute'}
+        
+        if not is_valid:
+            if toolbar and toolbar.location.x < 500000:
+                toolbar.location = (999999, 999999)
+            # Reset cache so re-selection triggers update
+            self._toolbar_last_select = False
+            self._toolbar_last_active = ""
+            return 0.5 # Slow down significantly when no toolbar is needed
+             
+        # 3. CHANGE PROTECTION (Only run if something actually moved or changed)
+        last_loc = getattr(self, "_toolbar_last_loc", (0,0))
+        current_loc = (active.location.x, active.location.y)
+        last_active = getattr(self, "_toolbar_last_active", "")
+        last_select = getattr(self, "_toolbar_last_select", False)
+        
+        if (current_loc == last_loc and 
+            active.name == last_active and 
+            active.select == last_select):
+            # Nothing moved, nothing changed.
+            return 0.2 # Quiet speed during idle selection
+            
+        self._toolbar_last_loc = current_loc
+        self._toolbar_last_active = active.name
+        self._toolbar_last_select = active.select
+
+        # 4. UPDATE TOOLBAR
+        if not toolbar:
+            toolbar = self.nodes.new('SDN_ToolbarNode')
+            self._toolbar_name = toolbar.name
+            
+        # UI Polish (Headerless and Hidden)
+        if toolbar.hide: toolbar.hide = False
+        if toolbar.select: toolbar.select = False
+        
+        # Color match (#1a1a1a)
+        target_color = (0.102, 0.102, 0.102)
+        if not toolbar.use_custom_color or any(abs(c1 - c2) > 0.01 for c1, c2 in zip(toolbar.color, target_color)):
+            toolbar.use_custom_color = True
+            toolbar.color = target_color
+
+        # Sync target node
+        if toolbar.target_node_name != active.name:
+            toolbar.target_node_name = active.name
+        
+        # Calculate Position (Top-Right Offset)
+        # 70 pixels up, Right-aligned with 10px breathing room
+        tx = active.location.x + active.width - toolbar.width - 10
+        ty = active.location.y + 70
+        
+        if (toolbar.location.x != tx or toolbar.location.y != ty):
+            toolbar.location = (tx, ty)
+            return 0.05 # High speed while moving
+            
+        return 0.2 # Normal speed while selected but still
 
     def id_clear_update(self):
         ids = set()
@@ -1029,18 +1129,19 @@ class CFNodeTree(NodeTree):
     @staticmethod
     def update_tree_handler():
         try:
-            for group in bpy.data.node_groups:
-                group: CFNodeTree = group
-                if group.bl_idname != TREE_TYPE:
-                    continue
-                group.update_tick()
-        except ReferenceError:
-            ...
+            # OPTIMIZATION: Manually find the active Node Editor
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type == 'NODE_EDITOR':
+                        space = area.spaces.active
+                        if space and space.tree_type == TREE_TYPE:
+                            group = space.edit_tree
+                            if group:
+                                next_run = group.update_tick()
+                                return next_run if isinstance(next_run, (int, float)) else 0.2
         except Exception as e:
-            # logger.warn(str(e))
             traceback.print_exc()
-            logger.error(f"{type(e).__name__}: {e}")
-        return 1
+        return 0.5 # Deep rest when no Node Editor is active
 
 
 class CFNodeCategory(NodeCategory):
@@ -1173,16 +1274,16 @@ def register_classes_factory(classes):
 
 def reg_class_internal():
     from .nodes import NodeBase, SDNConfig
-    bpy.types.NodeSocketColor.slot_index = bpy.props.IntProperty(default=0)
-    bpy.types.NodeSocketColor.index = bpy.props.IntProperty(default=-1)
-    bpy.types.NodeSocketColor.sid = bpy.props.StringProperty(default="")
-    bpy.types.NodeSocketColor.io_type = bpy.props.StringProperty(default="")
+    bpy.types.NodeSocket.slot_index = bpy.props.IntProperty(default=0)
+    bpy.types.NodeSocket.index = bpy.props.IntProperty(default=-1)
+    bpy.types.NodeSocket.sid = bpy.props.StringProperty(default="")
+    bpy.types.NodeSocket.io_type = bpy.props.StringProperty(default="")
     if bpy.app.version >= (4, 0):
-        bpy.types.NodeTreeInterfaceSocketColor.sid = bpy.props.StringProperty(default="")
-        bpy.types.NodeTreeInterfaceSocketColor.io_type = bpy.props.StringProperty(default="")
+        bpy.types.NodeTreeInterfaceSocket.sid = bpy.props.StringProperty(default="")
+        bpy.types.NodeTreeInterfaceSocket.io_type = bpy.props.StringProperty(default="")
     else:
-        bpy.types.NodeSocketInterfaceColor.sid = bpy.props.StringProperty(default="")
-        bpy.types.NodeSocketInterfaceColor.io_type = bpy.props.StringProperty(default="")
+        bpy.types.NodeSocketInterface.sid = bpy.props.StringProperty(default="")
+        bpy.types.NodeSocketInterface.io_type = bpy.props.StringProperty(default="")
     for inode in [bpy.types.NodeReroute, bpy.types.NodeFrame, bpy.types.NodeGroupInput, bpy.types.NodeGroupOutput]:
         inode.id = bpy.props.StringProperty(default="-1")
         inode.sdn_order = bpy.props.IntProperty(default=-1)

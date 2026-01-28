@@ -1371,16 +1371,16 @@ class TaskManager:
                 {"status": {"exec_info": {"queue_remaining": 1}}, "sid": "ComfyUICUP"}
                 SessionId["SessionId"] = data.get("sid", SessionId["SessionId"])
                 TaskManager.try_play_finished_sound(data)
-            elif mtype == "executing":
                 {"type": "executing", "data": {"node": "7"}}
-                if not data["node"]:
+                node_id = data.get("node")
+                if not node_id:
                     if tm.cur_task:
                         tm.cur_task.set_finished()
                     tm.mark_finished()
                 else:
-                    TaskManager.execute_status_record.append(data["node"])
+                    TaskManager.execute_status_record.append(node_id)
                     if tm.cur_task:
-                        tm.cur_task.set_executing_node_id(n)
+                        tm.cur_task.set_executing_node_id(node_id)
             elif mtype == "progress":
                 m = 40
                 fac = m / data["max"]
@@ -1394,15 +1394,15 @@ class TaskManager:
                     tm.cur_task.set_process(data)
             elif mtype == "progress_state":
                 pass
-            elif mtype == "executed":
                 {"node": "9", "output": {"images": ["ComfyUI_00028_.png"]}}
                 if TaskManager.progress_bar != 0:
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     TaskManager.progress_bar = 0
                 tm.push_res(data)
-                logger.warning("%s: %s", _T("Ran Node"), data["node"])
-                WindowLogger.push_log("%s: %s", _T("Ran Node"), data["node"])
+                node_id = data.get("node", "")
+                logger.warning("%s: %s", _T("Ran Node"), node_id)
+                WindowLogger.push_log("%s: %s", _T("Ran Node"), node_id)
             elif mtype == "execution_error":
                 _msg = data.get("message", None)
                 if not _msg:
@@ -1425,8 +1425,9 @@ class TaskManager:
             elif mtype == "execution_start":
                 ...
             elif mtype == "execution_success":
-                logger.warning("%s: %s", _T("Execute Node Success"), data["node"])
-                WindowLogger.push_log("%s: %s", _T("Execute Node Success"), data["node"])
+                node_id = data.get("node", "")
+                logger.warning("%s: %s", _T("Execute Node Success"), node_id)
+                WindowLogger.push_log("%s: %s", _T("Execute Node Success"), node_id)
             elif mtype == "execution_interrupted":
                 {
                     "type": "execution_interrupted",
